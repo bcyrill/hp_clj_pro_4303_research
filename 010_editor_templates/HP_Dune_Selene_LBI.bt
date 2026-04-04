@@ -1,0 +1,455 @@
+//------------------------------------------------
+//--- 010 Editor v14.0 Binary Template
+//
+//      File: HP_LBI.bt
+//   Version: 1.4
+//   Purpose: Parse HP CLJ Pro 4301 / TX54 Loadable Boot Image (LBI)
+//            partitions (UpdatableLBI and RecoveryLBI).
+//
+//  Category: Firmware
+// File Mask: *lbi*;mtd1*;mtd5*
+//  ID Bytes: BA D2 BF ED
+//
+//   History:
+//   1.6   2026-03-14  MAJOR CORRECTION: auth block field layout revised based
+//                     on disassembly of crypto provider feed_data function.
+//                     Bytes 0x06-0x07 are key_index (BE16), bytes 0x08-0x09
+//                     are sig_length (BE16), bytes 0x0A-0x109 are the RSA-2048
+//                     signature.  No HMAC-SHA1 or separate SHA-256 field exists.
+//                     NAND_IsAuthHeaderValid checks sig_length=256, not key_index.
+//   1.5   2026-03-14  Update auth block comments: dual interpretation as
+//                     SecureBoot header (bytes 2-5 form streaming coverage
+//                     value), HMAC/SHA-256 targets clarified, role flag
+//                     0x01 noted as auth-section companion bit.  Rename
+//                     attr_flags → image_type: field is never read by the
+//                     bootloader (confirmed by decompilation of both stages);
+//                     it is toolchain metadata only.
+//   1.4   2026-03-13  Add descriptor table validation: exactly one ENTRY,
+//                     last section must be SIG.
+//   1.3   2026-03-13  Correct role flag labels: 0x80=ENTRY, 0x2000=SIG,
+//                     0x800 and 0x01 marked as unknown.
+//   1.2   2026-03-13  Fix descriptor struct sizing: remove field-level
+//                     read= attrs that broke array element size (4 instead
+//                     of 24), rename 'size' field to avoid conflicts.
+//   1.1   2026-03-13  Fix duplicate-array error by wrapping per-section
+//                     data in a parameterised struct (SECTION_PAYLOAD).
+//   1.0   2026-03-13  Initial version.
+//
+//   The LBI (Loadable Boot Image) is the firmware container used by
+//   HP's CLJ Pro 4301-4303 printer platform (codename TX54,
+//   Dune/Selene).
+//
+//   It is used for both:
+//     - UpdatableLBI (NAND partition #1, mtd1, offset 0x00040000, 5 MiB)
+//     - RecoveryLBI  (NAND partition #5, mtd5, offset 0x1FB60000, ~4.7 MiB)
+//
+//   On-NAND layout:
+//     +0x000           LBI header (20 bytes)
+//     +0x014           Section descriptor table (num_sections x 24 bytes)
+//     +0x08C..0x7FF    Zero padding (to data_start alignment boundary)
+//     +data_start      Section 0 payload (Boot logo BMP)
+//       ...aligned...  Section 1 payload (2nd-stage bootloader, BL2)
+//       ...aligned...  Section 2 payload (Device Tree Blob)
+//       ...aligned...  Section 3 payload (Kernel zImage)
+//       ...aligned...  Section 4 payload (Authentication block)
+//     ...0xFF padding to end of partition...
+//
+//   References:
+//     - bl1_lbi_loader_analysis.md       (BL1 reverse engineering)
+//     - HP_TX54_Security_Analysis_v2.md  (security analysis)
+//     - hp_tx54_nand.ksy                 (Kaitai Struct definition)
+//     - lbi.ksy                          (generic LBI format)
+//     - firmware_toolkit LBI plugin      (plugin.py)
+//     - HP_LBI_AuthBlock.bt              (detailed auth block template)
+//------------------------------------------------
+
+BigEndian();
+
+//------------------------------------------------
+// Color definitions
+//------------------------------------------------
+local int COLOR_HEADER      = 0xB0D0FF;  // light blue
+local int COLOR_DESCRIPTOR  = 0xD0B0FF;  // light purple
+local int COLOR_PADDING     = 0xE0E0E0;  // light grey
+local int COLOR_BMP         = 0xFFD0B0;  // light orange
+local int COLOR_BL2         = 0xB0FFD0;  // light green
+local int COLOR_DTB         = 0xB0D0FF;  // light blue
+local int COLOR_ZIMAGE      = 0xFFFFB0;  // light yellow
+local int COLOR_AUTH        = 0xFFB0B0;  // light red
+local int COLOR_TRAIL       = 0xD0D0D0;  // grey
+
+//------------------------------------------------
+// Section role flag read-string helpers
+//------------------------------------------------
+string ReadRoleFlags(uint32 f) {
+    local string s;
+    local string bits = "";
+
+    if (f & 0x0001) bits += "AUTH_COMPANION|";
+    if (f & 0x0080) bits += "ENTRY|";
+    if (f & 0x0800) bits += "OVERRIDE_DEST|";
+    if (f & 0x2000) bits += "SIG|";
+
+    if (Strlen(bits) > 0)
+        bits = SubStr(bits, 0, Strlen(bits) - 1);
+    else
+        bits = "NONE";
+
+    SPrintf(s, "0x%04X [%s]", f, bits);
+    return s;
+}
+
+string ReadImageType(uint32 f) {
+    local string s;
+    // Image type tag — written by LBI packing tool, never read by bootloader.
+    // Values do not correspond to any known public enumeration.
+    switch (f) {
+        case 0x00: SPrintf(s, "0x%X (plain/BL2)", f); break;
+        case 0x04: SPrintf(s, "0x%X (DTB)", f); break;
+        case 0x0A: SPrintf(s, "0x%X (zImage)", f); break;
+        default:   SPrintf(s, "0x%X (?)", f); break;
+    }
+    return s;
+}
+
+//------------------------------------------------
+// LBI Base Header (20 bytes)
+//------------------------------------------------
+typedef struct {
+    uint32  magic <format=hex, comment="LBI magic: 0xBAD2BFED">;
+    uint32  format_version <comment="Format version (1)">;
+    uint32  header_size <format=hex,
+        comment="Total header size (base 20 + descriptors)">;
+    uint32  num_sections <comment="Number of section descriptors (5)">;
+    uint32  data_start <format=hex,
+        comment="Offset of first section data / alignment (0x800)">;
+} LBI_BASE_HEADER <bgcolor=COLOR_HEADER, comment="LBI base header">;
+
+//------------------------------------------------
+// Section Descriptor (24 bytes)
+//------------------------------------------------
+typedef struct {
+    uint32  role_flags <format=hex,
+        comment="Role: 0x80=ENTRY (BL2), 0x2000=SIG (auth), 0x800=OVERRIDE_DEST (framebuffer), 0x01=AUTH_COMPANION">;
+    uint32  load_address <format=hex,
+        comment="Physical DRAM load address (0 = not loaded)">;
+    uint32  sec_size <format=hex,
+        comment="Section payload size in bytes (0 for auth block)">;
+    uint32  image_type <format=hex,
+        comment="Image type tag (toolchain metadata, NOT read by bootloader): 0x0=plain, 0x4=DTB, 0xA=zImage">;
+    uint32  entry_point <format=hex,
+        comment="Entry point (non-zero for BL2 only)">;
+    uint32  reserved <format=hex, comment="Reserved (0)">;
+} SECTION_DESCRIPTOR <bgcolor=COLOR_DESCRIPTOR>;
+
+string ReadSectionDesc(SECTION_DESCRIPTOR &d) {
+    local string s;
+    local string role;
+    if (d.role_flags & 0x0800)      role = "BMP";
+    else if (d.role_flags & 0x0080) role = "BL2";
+    else if (d.role_flags & 0x2000) role = "Auth";
+    else if (d.image_type == 0x04)  role = "DTB";
+    else if (d.image_type == 0x0A)  role = "zImage";
+    else                            role = "data";
+    SPrintf(s, "[%s] size=0x%X load=0x%08X", role, d.sec_size, d.load_address);
+    return s;
+}
+
+//------------------------------------------------
+// Embedded Auth Block (320 bytes on-NAND)
+//
+// This is a SecureBoot header — there is no separate "LBI" interpretation.
+// NAND_IsAuthHeaderValid checks the same fields that SecureBoot_FeedData
+// later parses (algo_selector, crypto_provider, key_index, reserved2).
+//
+// SecureBoot_FeedData parses the first 6 bytes as a streaming header:
+//   byte[0]   → algorithm selector (0x02 = SHA-256 streaming)
+//   byte[1]   → crypto provider ID
+//   bytes[2-5]→ 32-bit coverage value (big-endian, assembled as:
+//               byte[5] | byte[2]<<24 | byte[3]<<16 | byte[4]<<8)
+// For UpdatableLBI: coverage = 0x00403000 = offset of auth block = all
+// section data (BMP+BL2+DTB+zImage) is covered by streaming SHA-256.
+//
+// Bytes 6–265 (260 B) are then fed to the crypto provider as auth data.
+// The crypto provider parses:
+//   bytes[6-7]   → key_index (big-endian 16-bit), RSA key table index
+//   bytes[8-9]   → sig_length (big-endian 16-bit), must be ≤ 256
+//   bytes[10-265] → RSA signature (sig_length bytes)
+//
+// NAND_IsAuthHeaderValid checks: byte[0]==0x02, byte[1]==0x02,
+// byte[8]==0x01, byte[9]==0x00 — i.e., algo=2, provider=2, sig_len=256.
+//
+// NOTE: There is NO HMAC-SHA1 or separate SHA-256 hash field.
+// Bytes 0x0A-0x109 are the complete RSA-2048 signature.
+//------------------------------------------------
+typedef struct {
+    uchar   algo_selector <comment="Algorithm type (0x02 = SHA-256 streaming)">;
+    uchar   crypto_provider <comment="Crypto provider ID (0x02)">;
+    uint32  coverage <format=hex,
+        comment="Streaming coverage in bytes, big-endian (0x00403000)">;
+    uint16  key_index <format=hex,
+        comment="RSA key table index, big-endian (0x0014 = 20)">;
+    uint16  sig_length <format=hex,
+        comment="RSA signature length, big-endian (0x0100 = 256)">;
+    uchar   rsa_signature[256] <format=hex, bgcolor=0xFFB0B0,
+        comment="RSA-2048 signature (PKCS#1 v1.5)">;
+    uchar   padding[54] <bgcolor=0xE0E0E0,
+        comment="Zero padding (not fed to SecureBoot)">;
+} LBI_AUTH_BLOCK <bgcolor=COLOR_AUTH,
+    comment="Auth block (320 bytes: SecureBoot header + RSA-2048 sig)">;
+
+string ReadAuthBlock(LBI_AUTH_BLOCK &a) {
+    local string s;
+    SPrintf(s, "algo=%d provider=%d coverage=0x%08X key_idx=%d sig_len=%d",
+        a.algo_selector, a.crypto_provider, a.coverage,
+        a.key_index, a.sig_length);
+    return s;
+}
+
+//------------------------------------------------
+// SECTION_PAYLOAD — one per section, wraps all
+// per-section variables inside a struct so the
+// loop does not produce duplicate-name errors.
+//
+// Parameters:
+//   sec_idx       — section index (0..N-1)
+//   role          — role_flags from descriptor
+//   attr          — image_type from descriptor (toolchain tag, not used by FW)
+//   payload_size  — size field from descriptor
+//   alignment     — data_start (0x800)
+//------------------------------------------------
+typedef struct (int sec_idx, uint32 role, uint32 attr,
+                uint32 payload_size, uint32 alignment)
+{
+    local int actual_size = payload_size;
+
+    // --- Auth block (size=0 in descriptor, 320 bytes on NAND) ---
+    if (payload_size == 0 && (role & 0x2000)) {
+        actual_size = 320;
+        LBI_AUTH_BLOCK auth <read=ReadAuthBlock>;
+
+    // --- BMP splash ---
+    } else if (role & 0x0800) {
+        LittleEndian();
+        char    bmp_magic[2] <comment="BMP magic 'BM'">;
+        uint32  bmp_file_size <comment="BMP file size">;
+        uint16  bmp_rsv1;
+        uint16  bmp_rsv2;
+        uint32  bmp_pixel_off <comment="Offset to pixel data">;
+        uint32  bmp_dib_size <comment="DIB header size (40)">;
+        int32   bmp_width <comment="Width (px)">;
+        int32   bmp_height <comment="Height (px)">;
+        uint16  bmp_planes;
+        uint16  bmp_bpp <comment="Bits per pixel">;
+        uint32  bmp_compress <comment="Compression">;
+        BigEndian();
+        if (payload_size > 42) {
+            uchar bmp_rest[payload_size - 42] <bgcolor=COLOR_BMP,
+                comment="BMP pixel + remaining header data">;
+        }
+
+    // --- BL2 ---
+    } else if (role & 0x0080) {
+        uchar data[payload_size] <bgcolor=COLOR_BL2,
+            comment="2nd-stage bootloader (Thumb-2 LE ARM32)">;
+
+    // --- DTB ---
+    } else if (attr == 0x04) {
+        uint32  fdt_magic <format=hex, comment="FDT magic: 0xD00DFEED">;
+        uint32  fdt_totalsize <comment="Total DTB size">;
+        uint32  fdt_off_struct <format=hex>;
+        uint32  fdt_off_strings <format=hex>;
+        uint32  fdt_off_rsvmap <format=hex>;
+        uint32  fdt_version <comment="FDT version (17)">;
+        uint32  fdt_last_comp <comment="Last compatible version">;
+        uint32  fdt_boot_cpu <comment="Boot CPU phys ID">;
+        uint32  fdt_sz_strings <comment="Strings block size">;
+        uint32  fdt_sz_struct <comment="Struct block size">;
+        if (payload_size > 40) {
+            uchar dtb_body[payload_size - 40] <bgcolor=COLOR_DTB,
+                comment="DTB structure + strings">;
+        }
+
+    // --- zImage ---
+    } else if (attr == 0x0A) {
+        LittleEndian();
+        uchar   z_stub[0x24] <comment="ARM decompressor stub">;
+        uint32  z_magic <format=hex, comment="zImage magic 0x016F2818">;
+        uint32  z_start <format=hex, comment="Kernel start offset">;
+        uint32  z_end <format=hex, comment="Kernel end offset">;
+        BigEndian();
+        if (payload_size > 0x30) {
+            uchar z_body[payload_size - 0x30] <bgcolor=COLOR_ZIMAGE,
+                comment="Compressed kernel data">;
+        }
+
+    // --- Generic / unknown ---
+    } else if (payload_size > 0) {
+        uchar data[payload_size] <comment="Section data">;
+    }
+
+    // --- Alignment padding to next boundary ---
+    local int end_pos = startof(this) + actual_size;
+    local int aligned = ((end_pos + alignment - 1) / alignment) * alignment;
+    local int pad = aligned - end_pos;
+    if (pad > 0 && aligned <= FileSize()) {
+        FSeek(end_pos);
+        uchar padding[pad] <bgcolor=COLOR_PADDING,
+            comment="Alignment padding">;
+    }
+} SECTION_PAYLOAD;
+
+string ReadSectionPayload(SECTION_PAYLOAD &p) {
+    local string s;
+    SPrintf(s, "offset=0x%06X size=%d", startof(p), p.actual_size);
+    return s;
+}
+
+//==========================================================
+// PARSE
+//==========================================================
+
+// ── Base header ──
+LBI_BASE_HEADER hdr;
+
+if (hdr.magic != 0xBAD2BFED) {
+    Warning("Bad LBI magic: 0x%08X (expected 0xBAD2BFED)", hdr.magic);
+    return;
+}
+
+// ── Section descriptor table ──
+local int i;
+SECTION_DESCRIPTOR desc[hdr.num_sections] <read=ReadSectionDesc, optimize=false>;
+
+// ── Validate descriptor table ──
+local int entry_count = 0;
+local int entry_idx = -1;
+for (i = 0; i < hdr.num_sections; i++) {
+    if (desc[i].role_flags & 0x0080) {
+        entry_count++;
+        entry_idx = i;
+    }
+}
+if (entry_count == 0)
+    Warning("No ENTRY (0x80) section found — expected exactly one (BL2).");
+else if (entry_count > 1)
+    Warning("Multiple ENTRY (0x80) sections found (%d) — expected exactly one.", entry_count);
+
+if (hdr.num_sections > 0) {
+    local uint32 last_role = desc[hdr.num_sections - 1].role_flags;
+    if (!(last_role & 0x2000))
+        Warning("Last section (#%d) does not have SIG flag (0x2000). ",
+                "role_flags=0x%04X — expected SIG as final section.",
+                hdr.num_sections - 1, last_role);
+}
+
+// ── Header-to-data padding ──
+local int hdr_end_pos = FTell();
+local int hdr_pad = hdr.data_start - hdr_end_pos;
+if (hdr_pad > 0) {
+    uchar header_padding[hdr_pad] <bgcolor=COLOR_PADDING,
+        comment="Zero-padding to data_start">;
+}
+
+// ── Section payloads ──
+// Compute each section's file offset from cumulative sizes.
+local int sec_file_offset = hdr.data_start;
+local int ds = hdr.data_start;
+local int sz;
+local int end_pos;
+local int next_aligned;
+
+for (i = 0; i < hdr.num_sections; i++) {
+    FSeek(sec_file_offset);
+
+    SECTION_PAYLOAD payload(i, desc[i].role_flags, desc[i].image_type,
+                            desc[i].sec_size, ds)
+        <read=ReadSectionPayload,
+         comment="Section payload + padding">;
+
+    // Advance file offset past data + padding
+    sz = desc[i].sec_size;
+    if (sz == 0 && (desc[i].role_flags & 0x2000)) sz = 320;
+    end_pos = sec_file_offset + sz;
+    next_aligned = ((end_pos + ds - 1) / ds) * ds;
+    sec_file_offset = next_aligned;
+}
+
+// ── Trailing partition fill ──
+local int trail = FileSize() - FTell();
+if (trail > 0) {
+    uchar trailing_fill[trail] <bgcolor=COLOR_TRAIL,
+        comment="Trailing partition fill (0xFF)">;
+}
+
+//==========================================================
+// Output window summary
+//==========================================================
+Printf("=== HP LBI Partition ===\n");
+Printf("  Magic:        0x%08X%s\n", hdr.magic,
+    hdr.magic == 0xBAD2BFED ? " (valid)" : " (INVALID!)");
+Printf("  Version:      %d\n", hdr.format_version);
+Printf("  Header size:  0x%X (%d bytes)\n", hdr.header_size, hdr.header_size);
+Printf("  Sections:     %d\n", hdr.num_sections);
+Printf("  Data start:   0x%X (%d)\n", hdr.data_start, hdr.data_start);
+Printf("  File size:    %d bytes (0x%X)\n", FileSize(), FileSize());
+
+Printf("\n  === Validation ===\n");
+if (entry_count == 1)
+    Printf("  ENTRY sections:  %d (OK, section #%d)\n", entry_count, entry_idx);
+else
+    Printf("  ENTRY sections:  %d (FAIL — expected exactly 1)\n", entry_count);
+
+if (hdr.num_sections > 0 && (desc[hdr.num_sections - 1].role_flags & 0x2000))
+    Printf("  Last is SIG:     yes (OK)\n");
+else
+    Printf("  Last is SIG:     no (FAIL — last section must be SIG)\n");
+Printf("\n");
+
+Printf("  === Section Table ===\n");
+Printf("  %s  %-10s %-10s %-10s %-6s %-10s %s\n",
+    "#", "Flags", "Load", "Size", "Attr", "Entry", "Role");
+
+local int off = hdr.data_start;
+local string role;
+for (i = 0; i < hdr.num_sections; i++) {
+    if (desc[i].role_flags & 0x0800)      role = "BMP splash";
+    else if (desc[i].role_flags & 0x0080) role = "BL2";
+    else if (desc[i].role_flags & 0x2000) role = "Auth block";
+    else if (desc[i].image_type == 0x04)  role = "DTB";
+    else if (desc[i].image_type == 0x0A)  role = "zImage";
+    else                                  role = "data";
+
+    Printf("  %d  0x%08X 0x%08X 0x%08X 0x%-4X 0x%08X %s\n",
+        i, desc[i].role_flags, desc[i].load_address,
+        desc[i].sec_size, desc[i].image_type,
+        desc[i].entry_point, role);
+    Printf("     data_offset = 0x%06X\n", off);
+
+    sz = desc[i].sec_size;
+    if (sz == 0 && (desc[i].role_flags & 0x2000)) sz = 320;
+    end_pos = off + sz;
+    off = ((end_pos + ds - 1) / ds) * ds;
+}
+
+Printf("\n  === Layout Map ===\n");
+Printf("  %-18s %-14s %s\n", "Region", "Offset", "Size");
+
+off = hdr.data_start;
+for (i = 0; i < hdr.num_sections; i++) {
+    if (desc[i].role_flags & 0x0800)      role = "Boot logo BMP";
+    else if (desc[i].role_flags & 0x0080) role = "BL2";
+    else if (desc[i].role_flags & 0x2000) role = "Auth block";
+    else if (desc[i].image_type == 0x04)  role = "DTB";
+    else if (desc[i].image_type == 0x0A)  role = "Kernel zImage";
+    else                                  role = "section";
+
+    sz = desc[i].sec_size;
+    if (sz == 0 && (desc[i].role_flags & 0x2000)) sz = 320;
+
+    Printf("  %-18s 0x%06X       %d\n", role, off, sz);
+
+    end_pos = off + sz;
+    off = ((end_pos + ds - 1) / ds) * ds;
+}
+Printf("  %-18s 0x%06X       %d\n", "Trailing fill", off, FileSize() - off);

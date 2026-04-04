@@ -1,0 +1,920 @@
+//------------------------------------------------
+// HP Dune/Selene Platform — M24256BW EEPROM Template
+// 010 Editor Binary Template
+//
+// Firmware: 6.17.5.40-202503181735
+// EEPROM:   M24256BW I2C (32 KB, 512 pages x 64 bytes)
+// Platform: ARM v7 (BE8 bootloader, LE kernel)
+//
+// Reverse-engineered from dune_selene_nandboot.bin,
+// dune_selene_kexec_trusted_fw.bin (bootloaders),
+// and kernel_6.17.elf (Linux kernel NVM driver).
+//
+// Three-tier architecture:
+//   Tier 1: Bootloader partitioned fields (0x000-0x0C1)
+//   Tier 2: Bootloader flat fields (0x100-0x131)
+//   Tier 3: Kernel NVM object storage (0x2C0+)
+//
+// Bootloader field layout from type 0x40 sub-partition
+// table at binary address 0x9FF33AA4 (21 entries).
+// Kernel NVM layout from _nvm_build_table decompilation.
+//------------------------------------------------
+
+LittleEndian();
+
+//------------------------------------------------
+// Color definitions
+//------------------------------------------------
+local int cControl     = 0xFFE4B5;  // moccasin
+local int cInternal    = 0xD3D3D3;  // light gray
+local int cField       = 0xADD8E6;  // light blue
+local int cMirror      = 0xFFA07A;  // light salmon
+local int cChecksum    = 0xFF6347;  // tomato
+local int cSerial      = 0xFFD700;  // gold
+local int cCounter     = 0xFFB6C1;  // light pink
+local int cFlatField   = 0x98FB98;  // pale green
+local int cNVM2Header  = 0xDDA0DD;  // plum
+local int cBitmap      = 0xB0C4DE;  // light steel blue
+local int cNVMObject   = 0xFFA500;  // orange
+local int cMAC         = 0x90EE90;  // light green
+local int cPadding     = 0xD3D3D3;  // light gray
+local int cDynGap      = 0xE8E8E8;  // lighter gray
+local int cRootPtr     = 0xDDA0DD;  // plum (matches NVM2 header)
+
+//------------------------------------------------
+// Protection type enum
+//------------------------------------------------
+typedef enum <ubyte> {
+    PROT_MIRROR_CHECKSUM     = 0,  // primary + mirror(XOR 0xFF) + checksum (2N+1)
+    PROT_PRIMARY_ONLY        = 1,  // primary only (N)
+    PROT_MIRROR_ONLY         = 2,  // primary + mirror(XOR 0xFF) (2N)
+    PROT_MIRROR_CHECKSUM_ALT = 3,  // same as 0, different checksum seed (2N+1)
+} PROT_TYPE;
+
+//------------------------------------------------
+// SECTION 1: NVM Partitioned Field Region (0x000–0x0C1)
+//
+// Layout defined by type 0x40 sub-partition table.
+// Offsets computed by accumulating entry sizes:
+//   0x00(1) 0x17(4) 0x01(1) 0x0A(2) 0x18(4) 0x09(5)
+//   0x08(30*) 0x0D(41) 0x0E(2) 0x19(2) 0x10(2) 0x12(2)
+//   0x1A(2) 0x14(4) 0x15(4) 0x16(2) 0x11(0) 0x04(70)
+//   0x05(2) 0x06(14) 0x07(rest)
+//
+// Multi-byte field values are big-endian (firmware reads
+// them via NVM_ReadField with byte | val << 8 assembly).
+//------------------------------------------------
+
+typedef struct {
+    // Entry 0: NVM2_CONTROL (part_id=0x00, size=1, prot1)
+    // Offset 0x000
+    SetBackColor(cControl);
+    ubyte   nvm2_control <format=hex, comment="NVM2 control byte (0x44 = type 0x40 active)">;
+
+    // Entry 1: Internal partition 0x17 (size=4)
+    // Offset 0x001–0x004
+    SetBackColor(cInternal);
+    ubyte   internal_0x17[4] <format=hex, comment="Internal partition 0x17">;
+
+    // Entry 2: MAP_REVISION (part_id=0x01, size=1, prot1)
+    // Offset 0x005
+    SetBackColor(cField);
+    ubyte   map_revision <format=hex, comment="MAP_REVISION (prot1)">;
+
+    // Entry 3: POWER_STATE (part_id=0x0A, size=2, prot2: primary+mirror)
+    // Offset 0x006–0x007
+    // Bit 0: Power-on flag
+    // Bit 1: System powered on
+    // Bit 2: Abnormal shutdown (triggers recovery mode in Boot_DetermineBootMode)
+    // Bit 4: Debug mode
+    // Bit 5: Boot attempted (set by NVM_SetBootAttemptedFlag before kernel launch)
+    SetBackColor(cMirror);
+    struct POWER_STATE_FIELD {
+        ubyte primary <format=hex, comment="bit0=power-on, bit1=powered, bit2=abnormal shutdown→recovery, bit4=debug, bit5=boot attempted">;
+        ubyte mirror  <format=hex, comment="Power state mirror (primary XOR 0xFF)">;
+    } power_state <comment="POWER_STATE (prot2: primary+mirror)">;
+
+    // Entry 4: Internal partition 0x18 (size=4)
+    // Offset 0x008–0x00B
+    SetBackColor(cInternal);
+    ubyte   internal_0x18[4] <format=hex, comment="Internal partition 0x18">;
+
+    // Entry 5: BOARD_ID (part_id=0x09, size=5, prot0: 2B primary + 2B mirror + 1B checksum)
+    // Offset 0x00C–0x010
+    SetBackColor(cField);
+    struct BOARD_ID_FIELD {
+        ubyte   primary[2] <format=hex, comment="Board ID primary (2 bytes, BE: 0xA284)">;
+        ubyte   mirror[2]  <format=hex, comment="Board ID mirror (primary XOR 0xFF)">;
+        ubyte   checksum   <format=hex, comment="Board ID checksum (prot0)">;
+    } board_id <comment="BOARD_ID (prot0: primary+mirror+checksum)">;
+
+    // Entry 6: Dynamic gap partition 0x08 (size=30 for NVM2_CONTROL=0x44)
+    // Offset 0x011–0x02E
+    // Size = (lower_nibble + 3) * 4 + 2 = (4+3)*4+2 = 30
+    SetBackColor(cDynGap);
+    ubyte   dynamic_gap_0x08[30] <format=hex, comment="Dynamic gap (part 0x08, size=(ctrl_lo+3)*4+2=30)">;
+
+    // Entry 7: SERIAL_NUMBER (part_id=0x0D, size=41, prot3: 20B primary + 20B mirror + 1B checksum)
+    // Offset 0x02F–0x057
+    SetBackColor(cSerial);
+    struct SERIAL_NUMBER_FIELD {
+        char    primary[20]  <comment="Serial number primary (20 bytes, ASCII padded with zeros)">;
+        ubyte   mirror[20]   <format=hex, comment="Serial number mirror (each byte XOR 0xFF)">;
+        ubyte   checksum     <format=hex, comment="Serial number checksum (prot3)">;
+    } serial_number <comment="SERIAL_NUMBER (prot3: primary+mirror+checksum)">;
+
+    // Entry 8: BOOT_FLAGS (part_id=0x0E, size=2, prot2: primary+mirror)
+    // Offset 0x058–0x059
+    // Bit 0: Power-on pending (cleared by UI_HandleBootMenu on next boot)
+    // Bit 1: Recovery mode (set by NVM_SetRecoveryMode, cleared by NVM_ClearRecoveryMode)
+    //        → checked by NVM_CheckRecoveryFlags → forces Recovery Partition boot
+    // Bit 2: Bad updatable partition (set by Boot_SetRecoveryAndReset on OTP fail)
+    // Bit 5: Cleared by Boot_ValidateAndLaunch (1st-stage) after successful image launch
+    // Bit 6: One-time recovery (set by NVM_SetOneTimeRecoveryBit; cleared after single recovery boot)
+    // Bit 7: NVM initialized — factory-set, never written by production firmware
+    SetBackColor(cMirror);
+    struct BOOT_FLAGS_FIELD {
+        ubyte primary <format=hex, comment="bit0=pwr-on pending, bit1=recovery, bit2=bad updatable, bit5=validated, bit6=one-time recy, bit7=NVM init (factory)">;
+        ubyte mirror  <format=hex, comment="Boot flags mirror (primary XOR 0xFF)">;
+    } boot_flags <comment="BOOT_FLAGS (prot2: primary+mirror)">;
+
+    // Entry 9: Internal partition 0x19 (size=2)
+    // Offset 0x05A–0x05B
+    SetBackColor(cInternal);
+    ubyte   internal_0x19[2] <format=hex, comment="Internal partition 0x19">;
+
+    // Entry 10: BOOT_FLAGS3 (part_id=0x10, size=2, prot2: primary+mirror)
+    // Offset 0x05C–0x05D
+    // Bit 7: One-time recovery clear (checked by Boot_ClearOneTimeRecoveryFlag in first-stage)
+    // 0xFF/0xFF = uninitialized (mirror validation fails → treated as 0)
+    SetBackColor(cMirror);
+    struct BOOT_FLAGS3_FIELD {
+        ubyte primary <format=hex, comment="bit7=one-time recovery clear; 0xFF=uninitialized">;
+        ubyte mirror  <format=hex, comment="Boot flags 3 mirror (primary XOR 0xFF)">;
+    } boot_flags3 <comment="BOOT_FLAGS3 (prot2, uninitialized=0xFF/0xFF)">;
+
+    // Entry 11: POWER_STATE2 (part_id=0x12, size=2, prot2: primary+mirror)
+    // Offset 0x05E–0x05F
+    // Bit 1: Recovery flag (checked by NVM_IsRecoveryFlagSet; read early in
+    //        Boot_DetermineBootMode → overrides boot mode to 0x1D=recovery)
+    // Bit 2: Bad updatable partition marker (set when NAND_LoadLBIPartition fails)
+    // 0xFF/0xFF = uninitialized (mirror validation fails → treated as 0)
+    SetBackColor(cMirror);
+    struct POWER_STATE2_FIELD {
+        ubyte primary <format=hex, comment="bit1=recovery flag, bit2=bad updatable partition; 0xFF=uninitialized">;
+        ubyte mirror  <format=hex, comment="Power state 2 mirror (primary XOR 0xFF)">;
+    } power_state2 <comment="POWER_STATE2 (prot2, uninitialized=0xFF/0xFF)">;
+
+    // Entry 12: Internal partition 0x1A (size=2)
+    // Offset 0x060–0x061
+    SetBackColor(cInternal);
+    ubyte   internal_0x1A[2] <format=hex, comment="Internal partition 0x1A">;
+
+    // Entry 13: ASSERT_SEQ_NUM (part_id=0x14, size=4, prot1)
+    // Offset 0x062–0x065
+    // NOTE: Multi-byte value, firmware reads as big-endian
+    SetBackColor(cField);
+    ubyte   assert_seq_num[4] <format=hex, comment="ASSERT_SEQ_NUM (prot1, 4 bytes BE)">;
+
+    // Entry 14: PSKU_CONFIG (part_id=0x15, size=4, prot1)
+    // Offset 0x066–0x069
+    // 32-bit big-endian value with overlapping bit-field interpretations:
+    //   Bits [31:24]  top_byte       — Chip/board ID (0x2A=Dune, 0x29=Selene). In merge mode B, NVM-controlled.
+    //   Bits [16:15]  config_type_b  — Merge selector B (non-zero=active; NVM controls bits 31:24 + 16:15)
+    //   Bits [14:13]  config_type_a  — Merge selector A (non-zero=active; NVM controls bits 7:0 + 14:13)
+    //                                  Also: feature bits 6:5 (inverted) in the feature-flag API
+    //   Bits [12:11]  sku_level      — SKU access level: 0=unconfigured, 1=level 1, 3=level 3
+    //                                  Also: feature bits 4:3 (inverted) in the feature-flag API
+    //   Bits [14:8]   ~feature[6:0]  — Feature flags (INVERTED: 0=enabled, 1=disabled)
+    //       feature 0 (bit  8): (unknown)
+    //       feature 1 (bit  9): (unknown)
+    //       feature 2 (bit 10): (unknown; when enabled, implies feature 4)
+    //       feature 3 (bit 11): (unknown)
+    //       feature 4 (bit 12): RTC presence — adds "rtc" property to /product DTB node
+    //       feature 5 (bit 13): NOS_PSKU_FEATURE_DB_UI — display panel: 0=Luna-Mid, 1=Luna-Low
+    //       feature 6 (bit 14): Persistence lock — prevents PSKU from being cleared on panel detect
+    //   Bits [7:0]    flags_byte     — PSKU flags. Used for panel configuration matching. In merge mode A, NVM-controlled.
+    // Sample: 0x2A008442 → top=0x2A(Dune), config_b=01(active), features: RTC+Mid+Lock, flags=0x42
+    SetBackColor(cField);
+    ubyte   psku_config[4] <format=hex, comment="PSKU_CONFIG (prot1, 4 bytes BE) — see bit-field comments above">;
+
+    // Entry 15: EEPROM_RECOV_COUNT (part_id=0x16, size=2, prot1)
+    // Offset 0x06A–0x06B
+    SetBackColor(cField);
+    ubyte   eeprom_recov_count[2] <format=hex, comment="EEPROM_RECOV_COUNT (prot1, 2 bytes BE)">;
+
+    // Entry 16: Boundary marker (part_id=0x11, size=0)
+    // No bytes — just marks transition to counter partitions at 0x06C
+
+    // Entry 17: Counter_Data (part_id=0x04, size=70)
+    // Offset 0x06C–0x0B1 — Circular crash/panic log
+    // 5 slots × 14 bytes each. Written by bootloader panic dispatch
+    // (NVM_InitCounterPartition → FUN_9ff1a10a callback).
+    // Record format: [4B crash_code][2B error_code][4B detail][4B timestamp]
+    //   Assert:        crash_code = CRC16(filename\0) | (assert_code << 16)
+    //   PanicWithCode: crash_code = caller-defined
+    //   detail:        source filename pointer (bootloader RAM) or context
+    //   timestamp:     hardware timer value (0 if not yet initialized)
+    SetBackColor(cCounter);
+    BigEndian();  // Bootloader is BE8 — crash records stored big-endian
+    struct CRASH_RECORD {
+        uint    crash_code <format=hex, comment="Assert: CRC16(file\\0) | (code<<16); PanicWithCode: caller-defined">;
+        ushort  error_code <format=hex, comment="Severity/category code">;
+        uint    detail     <format=hex, comment="Source filename pointer (bootloader RAM) or context">;
+        uint    timestamp  <format=hex, comment="Hardware timer value (0 = not initialized)">;
+    } crash_log[5] <comment="Crash/panic log: 5-slot circular buffer of 14-byte records">;
+    LittleEndian();  // Restore for remaining fields
+
+    // Entry 18: Counter_State (part_id=0x05, size=2)
+    // Offset 0x0B2–0x0B3
+    // Byte[0]: bits[6:0] = current write index (0-4), bit[7] = bank flag
+    // Byte[1]: XOR checksum of all 70 Counter_Data bytes
+    // On init: if checksum mismatch → resets all counter data to 0 on next crash
+    SetBackColor(cCounter);
+    struct COUNTER_STATE {
+        ubyte   index_bank <format=hex, comment="bits[6:0]=write index (0-4), bit[7]=bank flag">;
+        ubyte   xor_checksum <format=hex, comment="XOR of all 70 Counter_Data bytes">;
+    } counter_state <comment="Counter state: write index + integrity checksum">;
+
+    // Entry 19: Counter_Config (part_id=0x06, size=14)
+    // Offset 0x0B4–0x0C1 — Reserved/unused (0xFF fill in both dumps)
+    SetBackColor(cCounter);
+    ubyte   counter_config[14] <format=hex, comment="Counter config (reserved, all 0xFF)">;
+
+    // Entry 20: Remaining_Space (part_id=0x07, size=rest)
+    // Offset 0x0C2–0x0FF
+    SetBackColor(cPadding);
+    ubyte   remaining[62] <format=hex, comment="Remaining partition space (0xFF fill)">;
+
+} NVM_PARTITIONED_FIELDS <comment="NVM partitioned field region (0x000-0x0FF, type 0x40 layout)">;
+
+//------------------------------------------------
+// SECTION 2: Flat NVM Fields (0x100–0x131)
+// 13 fields, contiguous, accessed via flat table
+// (partition_id > 0x80)
+//------------------------------------------------
+
+typedef struct {
+    // 0x100: MAP2_VERSION (field_id=0x10, pid=0x81, sz=2, prot=1)
+    ushort  map2_version <format=hex, comment="NVM map version 2", bgcolor=cFlatField>;
+
+    // 0x102: PcaSerialNumber (field_id=0x11, pid=0x82, sz=10, prot=1)
+    char    pca_serial_number[10] <comment="PCA serial number (NVM field)", bgcolor=cSerial>;
+
+    // 0x10C: ETH0_MAC_ADDR (field_id=0x12, pid=0x83, sz=6, prot=1)
+    ubyte   eth0_mac[6] <format=hex, comment="Ethernet MAC address", bgcolor=cMAC>;
+
+    // 0x112: WLAN0_MAC_ADDR (field_id=0x13, pid=0x84, sz=6, prot=1)
+    ubyte   wlan0_mac[6] <format=hex, comment="WLAN0 MAC address", bgcolor=cMAC>;
+
+    // 0x118: WLAN1_MAC_ADDR (field_id=0x14, pid=0x85, sz=6, prot=1)
+    ubyte   wlan1_mac[6] <format=hex, comment="WLAN1 MAC address", bgcolor=cMAC>;
+
+    // 0x11E: POWER_CYCLE_COUNT (field_id=0x15, pid=0x86, sz=2, prot=1)
+    // NVM_ReadField/WriteField use big-endian for ALL fields (flat + partitioned).
+    // Confirmed: read loop = uVar5 = *pbVar1 | uVar5 << 8
+    //            write loop = local_1c[i] = param >> (remaining * 8)
+    BigEndian();
+    ushort  power_cycle_count <comment="Power cycle count (BE — all NVM fields are BE)", bgcolor=cFlatField>;
+    LittleEndian();
+
+    // 0x120: SECURE_VARS (field_id=0x16, pid=0x87, sz=1, prot=1)
+    // Bit 2: Purpose TBD (set in both dumps; not read by any known bootloader function)
+    // Bit 7: Software Secure Boot override (2nd-stage TZ_CheckSecureBootFuse)
+    //         NOTE: This is NOT the primary Secure Boot control.
+    //         The primary control is the SoC hardware security fuse at 0x3C001048
+    //         (TZ_ReadSecurityFuse → TZ_IsSecureBootEnabled). The HW fuse propagates
+    //         through first-stage authentication → code integrity check, making
+    //         Secure Boot active even when this bit is clear.
+    ubyte   secure_vars <format=hex, comment="bit2=TBD, bit7=SW Secure Boot override (HW fuse at 0x3C001048 is primary)", bgcolor=cFlatField>;
+
+    // 0x121: BOOT_FLAGS2 (field_id=0x17, pid=0x88, sz=2, prot=1)
+    // Bit 2:  Updatable partition failed (1st-stage Boot_MarkPartitionFailed, magic==0x1A5A5A5A)
+    // Bit 3:  Recovery mode set (written by NVM_SetRecoveryMode; persistent record)
+    // Bit 4:  Recovery partition failed (1st-stage Boot_MarkPartitionFailed, magic!=0x1A5A5A5A)
+    // Bit 5:  Recovery mode cleared (written by NVM_ClearRecoveryMode)
+    // Bit 8:  UI boot mode 0x20 (written by UI_BootSubMenuInput)
+    // Bit 9:  UI boot mode 0x21 (written by UI_BootSubMenuInput)
+    // Bit 12: Factory reset requested (written by Boot_SetFactoryResetFlagAndReboot)
+    BigEndian();
+    ushort  boot_flags2 <format=hex, comment="bit2=updatable failed, bit3=recovery set, bit4=recovery failed, bit5=recovery cleared, bit8/9=UI boot mode, bit12=factory reset (BE)", bgcolor=cFlatField>;
+    LittleEndian();
+
+    // 0x123: MISC_1 (field_id=0x18, pid=0x89, sz=4, prot=1)
+    uint    misc_1 <format=hex, comment="Miscellaneous field 1 (0xFFFFFFFF = empty)", bgcolor=cFlatField>;
+
+    // 0x127: SAVE_RECOVER_ID (field_id=0x19, pid=0x90, sz=4, prot=1)
+    uint    save_recover_id <format=hex, comment="Save/recover identifier (0xFFFFFFFF = empty)", bgcolor=cFlatField>;
+
+    // 0x12B: MPCA_BPCA_PAIRING (field_id=0x1A, pid=0x91, sz=1, prot=2)
+    struct MPCA_BPCA_PAIR {
+        ubyte primary <format=hex, comment="MPCA/BPCA pairing primary">;
+        ubyte mirror  <format=hex, comment="MPCA/BPCA pairing mirror (XOR 0xFF)">;
+    } mpca_bpca_pairing <comment="MPCA/BPCA pairing (prot=2: mirror)", bgcolor=cMirror>;
+
+    // 0x12D: MISC_2 (field_id=0x1B, pid=0x92, sz=2, prot=1)
+    ushort  misc_2 <format=hex, comment="Miscellaneous field 2 (0xFFFF = empty)", bgcolor=cFlatField>;
+
+    // 0x12F: UNKNOWN_1C (field_id=0x1C, pid=0x93, sz=2, prot=1)
+    ushort  unknown_1c <format=hex, comment="Unknown field 0x1C", bgcolor=cFlatField>;
+} FLAT_NVM_FIELDS <comment="Flat NVM fields (0x100-0x131)">;
+
+//------------------------------------------------
+// Gap between flat fields end (0x131) and root
+// page pointer (0x1FE)
+//------------------------------------------------
+
+typedef struct {
+    ubyte data[0x1FE - 0x131] <format=hex>;
+} FLAT_TO_NVM2_GAP <comment="Gap: flat cache tail + unused (0x131-0x1FD)">;
+
+//------------------------------------------------
+// SECTION 3: Root Page Pointer (0x1FE–0x1FF)
+// Big-endian uint16, written by _write_root_page()
+// Points to start of NVM2 metadata (page 8 = 0x200)
+//------------------------------------------------
+
+typedef struct {
+    BigEndian();
+    ushort  root_page_ptr <format=hex, comment="Root page pointer (BE, page 8 = 0x0008 * 64 = 0x200)">;
+    LittleEndian();
+} ROOT_PAGE_PTR <comment="NVM2 root page pointer (0x1FE-0x1FF, big-endian)">;
+
+//------------------------------------------------
+// SECTION 4: NVM2 Header (0x200–0x212)
+//
+// Written by _write_root_page() and _format_nvm()
+// in the kernel NVM driver. Total 19 bytes (including
+// the root page pointer at 0x1FE).
+//
+// Fields decoded from kernel decompilation:
+//   _format_nvm: writes magic, version_info, counts,
+//     bitmap offsets, debug level, generation counter
+//   _nvm_build_table: reads object_count, max_objects,
+//     bitmap offsets to build object table
+//------------------------------------------------
+
+typedef struct {
+    // 0x200: Magic signature (LE uint32)
+    uint    magic <format=hex, comment="NVM2 magic: 0x7EEDC0DE">;
+
+    // 0x204: version_info = (key_id << 16) | version (LE uint32)
+    // key_id from device tree hp_key_id (value 1), version = 2
+    uint    version_info <format=hex, comment="(key_id << 16) | version = 0x00010002">;
+
+    // 0x208: Current object count (LE uint16)
+    // Incremented by _create_object, decremented by _delete_object
+    ushort  object_count <comment="Active NVM object count (268 old, 291 new)">;
+
+    // 0x20A: Max objects capacity (LE uint16)
+    ushort  max_objects <comment="Max object table capacity (300)">;
+
+    // 0x20C: Allocation bitmap EEPROM offset (LE uint16)
+    ushort  alloc_bitmap_offset <format=hex, comment="Allocation bitmap offset (0x0280 = page 10)">;
+
+    // 0x20E: Span bitmap EEPROM offset (LE uint16)
+    ushort  span_bitmap_offset <format=hex, comment="Span bitmap offset (0x0240 = page 9)">;
+
+    // 0x210: Debug level (uint8)
+    ubyte   debug_level <format=hex, comment="Debug verbosity (0xFF = disabled)">;
+
+    // 0x211: Generation / recovery counter (LE uint16)
+    ushort  generation_counter <comment="Generation/recovery counter (sysfs: eeprom_recovery_count)">;
+
+} NVM2_HEADER <comment="NVM2 header (0x200-0x212, 19 bytes)">;
+
+//------------------------------------------------
+// Padding between header end (0x213) and span
+// bitmap (0x240)
+//------------------------------------------------
+
+typedef struct {
+    ubyte padding[0x240 - 0x213] <format=hex>;
+} NVM2_HEADER_PADDING <comment="NVM2 header padding (0x213-0x23F, 0xFF fill)">;
+
+//------------------------------------------------
+// SECTION 5: Page Bitmaps (0x240–0x2BF)
+//
+// Two 64-byte bitmaps maintained by the kernel NVM
+// driver. Each bit corresponds to one 64-byte page
+// (bit 0 of byte 0 = page 0, etc.).
+//
+// Set by _nvm_allocate() via _set_bit().
+//------------------------------------------------
+
+typedef struct {
+    // Each bit = 1 page. 64 bytes = 512 bits = 512 pages
+    ubyte   bits[64] <format=hex, comment="Page bitmap (bit N = page N)">;
+} PAGE_BITMAP;
+
+//------------------------------------------------
+// SECTION 6: NVM Object Header
+//
+// Variable-length header (3-5 bytes) encoding from
+// _nvm_build_table and _create_object decompilation:
+//
+//   B0, B1, B2, [B3, [B4]]
+//   Object ID = (B0 << 16) | ((B2 & 0x3F) << 8) | B1
+//   End marker: 0xFF 0xFF 0xFF
+//
+//   Size encoding (B2[7:6]):
+//     00: 3-byte header, size = 1
+//     01: 3-byte header, size = 2
+//     10: 3-byte header, size = 4
+//     11: B3[7]=0 → 4-byte header, size = B3 (1-127)
+//         B3[7]=1 → 5-byte header, size = (B3&0x7F)<<8 | B4
+//------------------------------------------------
+
+typedef struct {
+    local uint64 start_pos = FTell();
+    local ubyte B0 = ReadUByte(start_pos);
+    local ubyte B1 = ReadUByte(start_pos + 1);
+    local ubyte B2 = ReadUByte(start_pos + 2);
+
+    // Compute object ID
+    local uint obj_id = ((uint)B0 << 16) | (((uint)B2 & 0x3F) << 8) | (uint)B1;
+
+    // Determine header size and data size
+    local int encoding = (B2 >> 6) & 0x3;
+    local int hdr_size = 3;
+    local int data_size = 0;
+
+    if (encoding <= 1) {
+        hdr_size = 3;
+        data_size = encoding + 1;
+    } else if (encoding == 2) {
+        hdr_size = 3;
+        data_size = 4;
+    } else {
+        local ubyte B3 = ReadUByte(start_pos + 3);
+        if (B3 & 0x80) {
+            hdr_size = 5;
+            local ubyte B4 = ReadUByte(start_pos + 4);
+            data_size = ((B3 & 0x7F) << 8) | B4;
+        } else {
+            hdr_size = 4;
+            data_size = B3;
+        }
+    }
+
+    // Read header bytes
+    ubyte   header[hdr_size] <format=hex, comment="Object header (variable length)">;
+
+    // Read object data
+    if (data_size > 0) {
+        ubyte   data[data_size] <format=hex, comment="Object data">;
+    }
+
+} NVM_OBJECT <comment="NVM object", read=ReadNVMObject>;
+
+string ReadNVMObject(NVM_OBJECT &obj) {
+    string s;
+    SPrintf(s, "ID=0x%06X size=%d", obj.obj_id, obj.data_size);
+    return s;
+}
+
+//------------------------------------------------
+// Main file structure
+//------------------------------------------------
+
+FSeek(0);
+
+// 0x000–0x0FF: NVM partitioned field region (type 0x40 layout)
+NVM_PARTITIONED_FIELDS partitioned_fields <comment="NVM partitioned fields (type 0x40 sub-partition layout)">;
+
+// 0x100–0x131: Flat NVM fields
+SetBackColor(cFlatField);
+FLAT_NVM_FIELDS flat_nvm_fields <comment="Flat NVM fields (0x100-0x131)">;
+
+// 0x131–0x1FD: Gap
+SetBackColor(cPadding);
+FLAT_TO_NVM2_GAP gap_flat_to_nvm2 <comment="Unused gap (0x131-0x1FD)">;
+
+// 0x1FE–0x1FF: Root page pointer (big-endian)
+SetBackColor(cRootPtr);
+ROOT_PAGE_PTR root_page_ptr <comment="NVM2 root page pointer">;
+
+// 0x200–0x212: NVM2 Header
+SetBackColor(cNVM2Header);
+NVM2_HEADER nvm2_header <comment="NVM2 partition header">;
+
+// Verify magic
+if (nvm2_header.magic != 0x7EEDC0DE) {
+    Printf("WARNING: NVM2 magic mismatch! Expected 0x7EEDC0DE, got 0x%08X\n", nvm2_header.magic);
+}
+
+// 0x213–0x23F: Header padding
+SetBackColor(cPadding);
+NVM2_HEADER_PADDING nvm2_padding <comment="NVM2 header padding (0xFF fill)">;
+
+// 0x240–0x27F: Span Bitmap (page 9)
+// Marks continuation pages of multi-page objects
+SetBackColor(cBitmap);
+PAGE_BITMAP span_bitmap <comment="Span bitmap (page 9): marks continuation pages of multi-page objects">;
+
+// 0x280–0x2BF: Allocation Bitmap (page 10)
+// Marks all pages containing NVM objects
+SetBackColor(cBitmap);
+PAGE_BITMAP alloc_bitmap <comment="Allocation bitmap (page 10): marks pages containing NVM objects">;
+
+// 0x2C0+: Kernel NVM Objects (pages 11+)
+// Parse NVM objects from allocated pages
+SetBackColor(cNVMObject);
+local int obj_start = 0x2C0;
+local int obj_count = 0;
+local int file_size = FileSize();
+local int cur_pos = obj_start;
+local ubyte ob0, ob1, ob2, ob3;
+local int obj_encoding, obj_hdr_size, obj_data_size;
+
+// Parse objects page by page
+// We iterate through pages and parse objects within each allocated page
+local int page_num;
+local int page_start;
+local int page_alloc_byte;
+local int page_alloc_bit;
+local int is_allocated;
+local int is_span;
+local int span_byte;
+local int span_bit;
+local int obj_pos;
+local int span_end;
+local int next_page;
+
+local int np_byte;
+local int np_bit;
+local int np_alloc;
+local int np_span;
+
+local int group_end;
+
+for (page_num = 11; page_num < 512; page_num++) {
+    page_alloc_byte = page_num / 8;
+    page_alloc_bit = page_num % 8;
+
+    // Check allocation bitmap
+    is_allocated = (ReadUByte(0x280 + page_alloc_byte) >> page_alloc_bit) & 1;
+    if (!is_allocated) continue;
+
+    // Check span bitmap — skip continuation pages (objects span from first page)
+    is_span = (ReadUByte(0x240 + page_alloc_byte) >> page_alloc_bit) & 1;
+    if (is_span) continue;
+
+    // This is a first page of an object group — parse objects
+    page_start = page_num * 64;
+
+    // Find how many contiguous span pages follow
+    span_end = page_num;
+    for (next_page = page_num + 1; next_page < 512; next_page++) {
+        np_byte = next_page / 8;
+        np_bit = next_page % 8;
+        np_alloc = (ReadUByte(0x280 + np_byte) >> np_bit) & 1;
+        np_span = (ReadUByte(0x240 + np_byte) >> np_bit) & 1;
+        if (np_alloc && np_span) {
+            span_end = next_page;
+        } else {
+            break;
+        }
+    }
+
+    group_end = (span_end + 1) * 64;
+    obj_pos = page_start;
+
+    FSeek(obj_pos);
+    while (obj_pos + 3 <= group_end && obj_pos + 3 <= file_size) {
+        ob0 = ReadUByte(obj_pos);
+        ob1 = ReadUByte(obj_pos + 1);
+        ob2 = ReadUByte(obj_pos + 2);
+
+        // End marker: 0xFF 0xFF with B2[5:0]=0x3F
+        if (ob0 == 0xFF && ob1 == 0xFF && (ob2 & 0x3F) == 0x3F) break;
+
+        // Determine object size to advance
+        obj_encoding = (ob2 >> 6) & 0x3;
+        if (obj_encoding <= 1) {
+            obj_hdr_size = 3;
+            obj_data_size = obj_encoding + 1;
+        } else if (obj_encoding == 2) {
+            obj_hdr_size = 3;
+            obj_data_size = 4;
+        } else {
+            if (obj_pos + 3 >= group_end) break;
+            ob3 = ReadUByte(obj_pos + 3);
+            if (ob3 & 0x80) {
+                obj_hdr_size = 5;
+                if (obj_pos + 4 >= group_end) break;
+                obj_data_size = ((ob3 & 0x7F) << 8) | ReadUByte(obj_pos + 4);
+            } else {
+                obj_hdr_size = 4;
+                obj_data_size = ob3;
+            }
+        }
+
+        if (obj_pos + obj_hdr_size + obj_data_size > group_end) break;
+
+        FSeek(obj_pos);
+        NVM_OBJECT nvm_objects;
+        obj_count++;
+        obj_pos += obj_hdr_size + obj_data_size;
+
+        if (obj_count > 500) break;
+    }
+
+    if (obj_count > 500) break;
+}
+
+// ------------------------------------------------
+// Validation section
+// ------------------------------------------------
+
+Printf("=== NVM Partitioned Field Validation ===\n\n");
+
+// Validate NVM2_CONTROL
+Printf("NVM2_CONTROL @ 0x000: 0x%02X", partitioned_fields.nvm2_control);
+if (partitioned_fields.nvm2_control == 0x44)
+    Printf(" (type 0x40, dynamic size = 30)\n");
+else
+    Printf(" (WARNING: template layout assumes 0x44!)\n");
+
+// Validate POWER_STATE mirror (0x006-0x007)
+local ubyte ps_p = partitioned_fields.power_state.primary;
+local ubyte ps_m = partitioned_fields.power_state.mirror;
+Printf("POWER_STATE @ 0x006: 0x%02X/0x%02X — %s\n",
+    ps_p, ps_m, ((ps_p ^ 0xFF) == ps_m) ? "Mirror OK" : "Mirror FAIL");
+
+// Validate BOARD_ID (0x00C-0x010, prot0: 2B primary + 2B mirror + 1B checksum)
+local ubyte bid_p0 = partitioned_fields.board_id.primary[0];
+local ubyte bid_p1 = partitioned_fields.board_id.primary[1];
+local ubyte bid_m0 = partitioned_fields.board_id.mirror[0];
+local ubyte bid_m1 = partitioned_fields.board_id.mirror[1];
+local ubyte bid_chk = partitioned_fields.board_id.checksum;
+
+local int bid_mirror_ok = ((bid_p0 ^ 0xFF) == bid_m0) && ((bid_p1 ^ 0xFF) == bid_m1);
+local ubyte bid_chk_computed = (bid_p0 ^ 0xFF ^ 0x00 ^ 0x00);
+bid_chk_computed = (bid_chk_computed ^ bid_p1 ^ 0x00) & 0xFF;
+local int bid_chk_ok = (bid_chk == bid_chk_computed);
+
+Printf("BOARD_ID @ 0x00C: 0x%02X%02X — Mirror %s, Checksum 0x%02X %s (computed 0x%02X)\n",
+    bid_p0, bid_p1,
+    bid_mirror_ok ? "OK" : "FAIL",
+    bid_chk,
+    bid_chk_ok ? "OK" : "FAIL",
+    bid_chk_computed);
+
+// Validate SERIAL_NUMBER (0x02F-0x057, prot3: 20B primary + 20B mirror + 1B checksum)
+local int sn_mirror_ok = 1;
+local int si;
+for (si = 0; si < 20; si++) {
+    if (((ubyte)partitioned_fields.serial_number.primary[si] ^ 0xFF) !=
+        partitioned_fields.serial_number.mirror[si]) {
+        sn_mirror_ok = 0;
+        break;
+    }
+}
+local ubyte sn_chk_computed = ((ubyte)partitioned_fields.serial_number.primary[0] ^ 0xFF ^ 0x00 ^ 0x03);
+for (si = 1; si < 20; si++) {
+    sn_chk_computed = (sn_chk_computed ^ (ubyte)partitioned_fields.serial_number.primary[si] ^ 0x00) & 0xFF;
+}
+local ubyte sn_chk_stored = partitioned_fields.serial_number.checksum;
+
+Printf("SERIAL_NUMBER @ 0x02F: \"%.10s\" — Mirror %s, Checksum 0x%02X %s (computed 0x%02X)\n",
+    partitioned_fields.serial_number.primary,
+    sn_mirror_ok ? "OK (20 bytes)" : "FAIL",
+    sn_chk_stored,
+    (sn_chk_stored == sn_chk_computed) ? "OK" : "FAIL",
+    sn_chk_computed);
+
+// Validate BOOT_FLAGS mirror (0x058-0x059)
+local ubyte bf_p = partitioned_fields.boot_flags.primary;
+local ubyte bf_m = partitioned_fields.boot_flags.mirror;
+Printf("BOOT_FLAGS @ 0x058: 0x%02X/0x%02X — %s\n",
+    bf_p, bf_m, ((bf_p ^ 0xFF) == bf_m) ? "Mirror OK" : "Mirror FAIL");
+
+// Decode POWER_STATE individual bits
+Printf("\n=== Boot Flag Bit Decode ===\n\n");
+Printf("POWER_STATE (0x%02X):\n", ps_p);
+Printf("  bit 0 (power-on flag):        %s\n", (ps_p & 0x01) ? "SET" : "clear");
+Printf("  bit 1 (system powered on):    %s\n", (ps_p & 0x02) ? "SET" : "clear");
+Printf("  bit 2 (abnormal shutdown):    %s  %s\n", (ps_p & 0x04) ? "SET" : "clear",
+    (ps_p & 0x04) ? "→ triggers recovery in Boot_DetermineBootMode" : "");
+Printf("  bit 4 (debug mode):           %s\n", (ps_p & 0x10) ? "SET" : "clear");
+Printf("  bit 5 (boot attempted):       %s  %s\n", (ps_p & 0x20) ? "SET" : "clear",
+    (ps_p & 0x20) ? "→ NVM_SetBootAttemptedFlag was called" : "");
+
+Printf("BOOT_FLAGS (0x%02X):\n", bf_p);
+Printf("  bit 0 (power-on pending):     %s  %s\n", (bf_p & 0x01) ? "SET" : "clear",
+    (bf_p & 0x01) ? "→ cleared by UI_HandleBootMenu on next boot" : "");
+Printf("  bit 1 (recovery mode):        %s  %s\n", (bf_p & 0x02) ? "SET" : "clear",
+    (bf_p & 0x02) ? "→ NVM_CheckRecoveryFlags forces Recovery Partition boot" : "");
+Printf("  bit 2 (bad updatable part):   %s  %s\n", (bf_p & 0x04) ? "SET" : "clear",
+    (bf_p & 0x04) ? "→ Boot_SetRecoveryAndReset (OTP fail)" : "");
+Printf("  bit 5 (launch validated):     %s  %s\n", (bf_p & 0x20) ? "SET" : "clear",
+    (bf_p & 0x20) ? "→ not yet cleared by Boot_ValidateAndLaunch" : "");
+Printf("  bit 6 (one-time recovery):    %s  %s\n", (bf_p & 0x40) ? "SET" : "clear",
+    (bf_p & 0x40) ? "→ single recovery boot, then cleared" : "");
+Printf("  bit 7 (NVM initialized):      %s  %s\n", (bf_p & 0x80) ? "SET" : "clear",
+    (bf_p & 0x80) ? "→ factory-set, never written by production firmware" : "");
+
+// Decode BOOT_FLAGS3 (may be uninitialized)
+local ubyte bf3_val = partitioned_fields.boot_flags3.primary;
+if (bf3_val == 0xFF && partitioned_fields.boot_flags3.mirror == 0xFF) {
+    Printf("BOOT_FLAGS3: uninitialized (0xFF/0xFF → treated as 0)\n");
+} else {
+    Printf("BOOT_FLAGS3 (0x%02X):\n", bf3_val);
+    Printf("  bit 7 (one-time recy clear):  %s\n", (bf3_val & 0x80) ? "SET" : "clear");
+}
+
+// Decode POWER_STATE2 (may be uninitialized)
+local ubyte ps2_val = partitioned_fields.power_state2.primary;
+if (ps2_val == 0xFF && partitioned_fields.power_state2.mirror == 0xFF) {
+    Printf("POWER_STATE2: uninitialized (0xFF/0xFF → treated as 0)\n");
+} else {
+    Printf("POWER_STATE2 (0x%02X):\n", ps2_val);
+    Printf("  bit 1 (recovery flag):        %s  %s\n", (ps2_val & 0x02) ? "SET" : "clear",
+        (ps2_val & 0x02) ? "→ overrides boot mode to 0x1D (recovery)" : "");
+    Printf("  bit 2 (bad updatable part):   %s  %s\n", (ps2_val & 0x04) ? "SET" : "clear",
+        (ps2_val & 0x04) ? "→ NAND_LoadLBIPartition failed" : "");
+}
+
+// Decode BOOT_FLAGS2 (flat field, BE uint16 — all NVM fields are big-endian)
+local ushort bf2_val = flat_nvm_fields.boot_flags2;
+Printf("BOOT_FLAGS2 (0x%04X):\n", bf2_val);
+Printf("  bit 2  (updatable failed):    %s  %s\n", (bf2_val & 0x0004) ? "SET" : "clear",
+    (bf2_val & 0x0004) ? "→ 1st-stage Boot_MarkPartitionFailed (updatable)" : "");
+Printf("  bit 3  (recovery mode set):   %s  %s\n", (bf2_val & 0x0008) ? "SET" : "clear",
+    (bf2_val & 0x0008) ? "→ NVM_SetRecoveryMode was called" : "");
+Printf("  bit 4  (recovery failed):     %s  %s\n", (bf2_val & 0x0010) ? "SET" : "clear",
+    (bf2_val & 0x0010) ? "→ 1st-stage Boot_MarkPartitionFailed (recovery)" : "");
+Printf("  bit 5  (recovery cleared):    %s  %s\n", (bf2_val & 0x0020) ? "SET" : "clear",
+    (bf2_val & 0x0020) ? "→ NVM_ClearRecoveryMode was called" : "");
+Printf("  bit 8  (UI boot mode 0x20):   %s\n", (bf2_val & 0x0100) ? "SET" : "clear");
+Printf("  bit 9  (UI boot mode 0x21):   %s\n", (bf2_val & 0x0200) ? "SET" : "clear");
+Printf("  bit 12 (factory reset):       %s  %s\n", (bf2_val & 0x1000) ? "SET" : "clear",
+    (bf2_val & 0x1000) ? "→ Boot_SetFactoryResetFlagAndReboot" : "");
+
+// Summary: boot partition decision
+Printf("\n--- Boot Partition Decision ---\n");
+local int will_recovery = 0;
+if (bf_p & 0x02) { Printf("  ** RECOVERY: BOOT_FLAGS bit 1 set (recovery mode)\n"); will_recovery = 1; }
+if (bf_p & 0x40) { Printf("  ** RECOVERY: BOOT_FLAGS bit 6 set (one-time recovery)\n"); will_recovery = 1; }
+if (ps_p & 0x04) { Printf("  ** RECOVERY: POWER_STATE bit 2 set (abnormal shutdown)\n"); will_recovery = 1; }
+if (ps2_val != 0xFF && (ps2_val & 0x02)) { Printf("  ** RECOVERY: POWER_STATE2 bit 1 set (recovery flag)\n"); will_recovery = 1; }
+if (!will_recovery) { Printf("  Normal boot: Updatable Partition @ NAND 0x40000\n"); }
+else { Printf("  → Will boot Recovery Partition @ NAND 0x1FB60000\n"); }
+
+// Print prot1 fields (no mirror, big-endian interpretation)
+Printf("ASSERT_SEQ_NUM @ 0x062: 0x%02X%02X%02X%02X (BE)\n",
+    partitioned_fields.assert_seq_num[0], partitioned_fields.assert_seq_num[1],
+    partitioned_fields.assert_seq_num[2], partitioned_fields.assert_seq_num[3]);
+local uint psku_val = ((uint)partitioned_fields.psku_config[0] << 24) |
+                      ((uint)partitioned_fields.psku_config[1] << 16) |
+                      ((uint)partitioned_fields.psku_config[2] << 8) |
+                       (uint)partitioned_fields.psku_config[3];
+Printf("PSKU_CONFIG @ 0x066: 0x%08X (BE)\n", psku_val);
+Printf("  top_byte=0x%02X  config_type_b=%u  config_type_a=%u  sku_level=%u  flags=0x%02X\n",
+    (psku_val >> 24) & 0xFF,
+    (psku_val >> 15) & 0x3,
+    (psku_val >> 13) & 0x3,
+    (psku_val >> 11) & 0x3,
+    psku_val & 0xFF);
+Printf("  features (inverted in NVM, shown as enabled/disabled):\n");
+Printf("    [0]=%s [1]=%s [2]=%s [3]=%s [4:RTC]=%s [5:Panel]=%s [6:Lock]=%s\n",
+    ((psku_val >> 8) & 1) ? "off" : "ON",
+    ((psku_val >> 9) & 1) ? "off" : "ON",
+    ((psku_val >> 10) & 1) ? "off" : "ON",
+    ((psku_val >> 11) & 1) ? "off" : "ON",
+    ((psku_val >> 12) & 1) ? "off" : "ON",
+    ((psku_val >> 13) & 1) ? "Luna-Low" : "Luna-Mid",
+    ((psku_val >> 14) & 1) ? "off" : "LOCKED");
+Printf("EEPROM_RECOV_COUNT @ 0x06A: 0x%02X%02X (BE, value=%u)\n",
+    partitioned_fields.eeprom_recov_count[0], partitioned_fields.eeprom_recov_count[1],
+    ((uint)partitioned_fields.eeprom_recov_count[0] << 8) | partitioned_fields.eeprom_recov_count[1]);
+
+// Validate Counter Partition (crash log)
+Printf("\n=== Counter Partition (Crash/Panic Log) ===\n\n");
+
+// Compute XOR checksum over all 70 Counter_Data bytes (5 × 14-byte records)
+local ubyte xor_computed = 0;
+local int ci;
+for (ci = 0; ci < 70; ci++) {
+    xor_computed = xor_computed ^ ReadUByte(0x06C + ci);
+}
+local ubyte xor_stored = partitioned_fields.counter_state.xor_checksum;
+local ubyte state_byte = partitioned_fields.counter_state.index_bank;
+local int cur_index = state_byte & 0x7F;
+local int bank_flag = (state_byte >> 7) & 1;
+
+Printf("Counter_State @ 0x0B2: index=%d, bank=%d, checksum=0x%02X %s (computed 0x%02X)\n",
+    cur_index, bank_flag, xor_stored,
+    (xor_stored == xor_computed) ? "OK" : "MISMATCH",
+    xor_computed);
+
+// Decode each crash record slot
+local int slot;
+local uint cr_code, cr_detail, cr_ts;
+local ushort cr_err;
+local int slot_empty;
+for (slot = 0; slot < 5; slot++) {
+    cr_code   = partitioned_fields.crash_log[slot].crash_code;
+    cr_err    = partitioned_fields.crash_log[slot].error_code;
+    cr_detail = partitioned_fields.crash_log[slot].detail;
+    cr_ts     = partitioned_fields.crash_log[slot].timestamp;
+
+    slot_empty = (cr_code == 0 && cr_err == 0 && cr_detail == 0 && cr_ts == 0) ||
+                 (cr_code == 0xFFFFFFFF && cr_err == 0xFFFF && cr_detail == 0xFFFFFFFF && cr_ts == 0xFFFFFFFF);
+
+    if (slot_empty) {
+        Printf("  Slot %d: empty\n", slot);
+    } else {
+        Printf("  Slot %d: code=0x%08X err=0x%04X detail=0x%08X ts=0x%08X",
+            slot, cr_code, cr_err, cr_detail, cr_ts);
+        // Check if this looks like an Assert record (code has assert_code in upper 16 bits)
+        if ((cr_code >> 16) != 0 && (cr_code & 0xFFFF) != 0) {
+            Printf(" [Assert 0x%04X, file_hash=0x%04X]",
+                (cr_code >> 16) & 0xFFFF, cr_code & 0xFFFF);
+        }
+        if (slot == cur_index) {
+            Printf(" ← current");
+        }
+        Printf("\n");
+    }
+}
+
+// Print flat field summary
+Printf("\n=== Flat NVM Fields ===\n\n");
+Printf("MAP2_VERSION:       0x%04X\n", flat_nvm_fields.map2_version);
+Printf("PcaSerialNumber:    %.10s\n", flat_nvm_fields.pca_serial_number);
+Printf("ETH0 MAC:           %02X:%02X:%02X:%02X:%02X:%02X\n",
+    flat_nvm_fields.eth0_mac[0], flat_nvm_fields.eth0_mac[1],
+    flat_nvm_fields.eth0_mac[2], flat_nvm_fields.eth0_mac[3],
+    flat_nvm_fields.eth0_mac[4], flat_nvm_fields.eth0_mac[5]);
+Printf("WLAN0 MAC:          %02X:%02X:%02X:%02X:%02X:%02X\n",
+    flat_nvm_fields.wlan0_mac[0], flat_nvm_fields.wlan0_mac[1],
+    flat_nvm_fields.wlan0_mac[2], flat_nvm_fields.wlan0_mac[3],
+    flat_nvm_fields.wlan0_mac[4], flat_nvm_fields.wlan0_mac[5]);
+Printf("WLAN1 MAC:          %02X:%02X:%02X:%02X:%02X:%02X\n",
+    flat_nvm_fields.wlan1_mac[0], flat_nvm_fields.wlan1_mac[1],
+    flat_nvm_fields.wlan1_mac[2], flat_nvm_fields.wlan1_mac[3],
+    flat_nvm_fields.wlan1_mac[4], flat_nvm_fields.wlan1_mac[5]);
+Printf("POWER_CYCLE_COUNT:  %u (0x%04X)\n",
+    flat_nvm_fields.power_cycle_count, flat_nvm_fields.power_cycle_count);
+Printf("SECURE_VARS:        0x%02X  %s\n", flat_nvm_fields.secure_vars,
+    (flat_nvm_fields.secure_vars & 0x80) ? "[SW Secure Boot override SET]" :
+    "[SW override clear — Secure Boot may still be active via HW fuse 0x3C001048]");
+Printf("BOOT_FLAGS2:        0x%04X\n", flat_nvm_fields.boot_flags2);
+Printf("MISC_1:             0x%08X\n", flat_nvm_fields.misc_1);
+Printf("SAVE_RECOVER_ID:    0x%08X\n", flat_nvm_fields.save_recover_id);
+Printf("MISC_2:             0x%04X\n", flat_nvm_fields.misc_2);
+Printf("UNKNOWN_1C:         0x%04X\n", flat_nvm_fields.unknown_1c);
+
+// Print NVM2 header with corrected field names
+Printf("\n=== NVM2 Header (from kernel NVM driver) ===\n\n");
+Printf("Root page pointer:  0x%04X (BE, page %d = EEPROM 0x%04X)\n",
+    root_page_ptr.root_page_ptr,
+    root_page_ptr.root_page_ptr,
+    root_page_ptr.root_page_ptr * 64);
+Printf("Magic:              0x%08X %s\n", nvm2_header.magic,
+    nvm2_header.magic == 0x7EEDC0DE ? "(valid)" : "(INVALID)");
+Printf("version_info:       0x%08X (key_id=%d, version=%d)\n",
+    nvm2_header.version_info,
+    (nvm2_header.version_info >> 16) & 0xFFFF,
+    nvm2_header.version_info & 0xFFFF);
+Printf("Object count:       %u\n", nvm2_header.object_count);
+Printf("Max objects:        %u\n", nvm2_header.max_objects);
+Printf("Alloc bitmap off:   0x%04X (page %d)\n",
+    nvm2_header.alloc_bitmap_offset,
+    nvm2_header.alloc_bitmap_offset / 64);
+Printf("Span bitmap off:    0x%04X (page %d)\n",
+    nvm2_header.span_bitmap_offset,
+    nvm2_header.span_bitmap_offset / 64);
+Printf("Debug level:        0x%02X\n", nvm2_header.debug_level);
+Printf("Generation counter: %u\n", nvm2_header.generation_counter);
+
+// Print bitmap summary
+Printf("\n=== Page Bitmaps ===\n\n");
+local int alloc_count = 0;
+local int span_count = 0;
+local int pi;
+local int pj;
+for (pi = 0; pi < 64; pi++) {
+    for (pj = 0; pj < 8; pj++) {
+        if ((ReadUByte(0x280 + pi) >> pj) & 1) alloc_count++;
+        if ((ReadUByte(0x240 + pi) >> pj) & 1) span_count++;
+    }
+}
+Printf("Allocated pages:    %d / 512\n", alloc_count);
+Printf("Span pages:         %d / 512\n", span_count);
+Printf("Free pages:         %d / 512\n", 512 - alloc_count);
+
+Printf("\n=== Kernel NVM Objects ===\n\n");
+Printf("Objects parsed:     %d\n", obj_count);
+Printf("Expected (header):  %d\n", nvm2_header.object_count);
+if (obj_count == nvm2_header.object_count) {
+    Printf("Object count:       MATCH\n");
+} else {
+    Printf("Object count:       MISMATCH (parsed %d, header says %d)\n",
+        obj_count, nvm2_header.object_count);
+}
+
+Printf("\nSerial (SERIAL_NUMBER @ 0x02F): %.10s\n", partitioned_fields.serial_number.primary);
+Printf("Serial (PcaSerialNumber @ 0x102): %.10s\n", flat_nvm_fields.pca_serial_number);

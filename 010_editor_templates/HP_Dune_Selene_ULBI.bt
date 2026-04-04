@@ -1,0 +1,791 @@
+//------------------------------------------------
+//--- 010 Editor v14.0 Binary Template
+//
+//      File: HP_Dune_Selene_ULBI.bt
+//   Version: 1.0
+//   Purpose: Parse HP CLJ Pro 4301-4303 / TX54 Updatable LBI firmware
+//            images with NAND OOB/ECC data interleaved (ULBI format).
+//
+//  Category: Firmware
+// File Mask: Ulbi*;*ulbi*
+//  ID Bytes: BA D2 BF ED
+//
+//   History:
+//   1.0   2026-04-04  Initial version — derived from HP_Dune_Selene_LBI.bt
+//                     for OOB-interleaved images extracted from BDL packages.
+//
+//   The ULBI (Updatable Loadable Boot Image) is the LBI firmware container
+//   as packaged inside BDL firmware update bundles for the HP CLJ Pro
+//   4301-4303 printer platform (codename TX54, Dune/Selene).
+//
+//   Unlike the data-only LBI images found on raw NAND partitions (after
+//   OOB stripping) or in memory, the ULBI retains the full NAND page
+//   layout:  2048 bytes of data + 64 bytes of OOB per page.  This is
+//   because the firmware updater writes Ulbi.bin to NAND as raw pages,
+//   bypassing the controller's on-the-fly ECC generation.
+//
+//   NAND chip: Toshiba TH58BVG2S3HTA00
+//     Page:        2112 bytes  (2048 data + 64 OOB)
+//     Pages/block: 64
+//     Block:       128 KiB data  (135,168 bytes raw)
+//     OOB layout:  12 bytes spare (0xFF) + 4 × 13 bytes BCH ECC
+//     ECC:         BCH(polynomial=8219, t=8)
+//
+//   Logical-to-physical mapping:
+//     physical = (logical / 2048) * 2112 + (logical % 2048)
+//   where "logical" is the data-only offset used in the LBI header fields.
+//
+//   File identification:
+//     - Magic 0xBAD2BFED at offset 0
+//     - File size is an exact multiple of 2112
+//     - File size is NOT an exact multiple of 2048
+//       (this distinguishes ULBI from data-only LBI)
+//
+//   See also: HP_Dune_Selene_LBI.bt      (data-only LBI template)
+//             HP_Dune_Selene_NAND_Analysis.md
+//             HP_Dune_Selene_Per_Block_Hashing.md
+//------------------------------------------------
+
+BigEndian();
+
+//------------------------------------------------
+// NAND geometry constants
+//------------------------------------------------
+local int PAGE_DATA    = 2048;
+local int PAGE_OOB     = 64;
+local int PAGE_RAW     = PAGE_DATA + PAGE_OOB;  // 2112
+local int PAGES_PER_BLK = 64;
+local int OOB_SPARE    = 12;
+local int OOB_ECC_SECT = 13;   // 4 sectors × 13 bytes = 52
+local int OOB_ECC_CNT  = 4;
+
+//------------------------------------------------
+// Format detection
+//------------------------------------------------
+if (FileSize() % PAGE_RAW != 0) {
+    Warning("File size %d is not a multiple of %d -- may not be a ULBI image.",
+            FileSize(), PAGE_RAW);
+}
+
+local int TOTAL_PAGES = FileSize() / PAGE_RAW;
+local int TOTAL_BLOCKS_FULL = TOTAL_PAGES / PAGES_PER_BLK;
+local int TOTAL_PAGES_REM = TOTAL_PAGES % PAGES_PER_BLK;
+
+//------------------------------------------------
+// Logical <-> physical offset conversion
+//------------------------------------------------
+// logical -> physical:
+//   physical = (logical / PAGE_DATA) * PAGE_RAW + (logical % PAGE_DATA)
+//
+// physical -> logical:
+//   logical = (physical / PAGE_RAW) * PAGE_DATA + (physical % PAGE_RAW)
+//   (only valid when physical % PAGE_RAW < PAGE_DATA)
+
+//------------------------------------------------
+// Color definitions
+//------------------------------------------------
+local int COLOR_HEADER      = 0xB0D0FF;  // light blue
+local int COLOR_DESCRIPTOR  = 0xD0B0FF;  // light purple
+local int COLOR_PADDING     = 0xE0E0E0;  // light grey
+local int COLOR_OOB_SPARE   = 0xC0FFC0;  // light green
+local int COLOR_OOB_ECC     = 0xA0E0A0;  // green
+local int COLOR_BMP         = 0xFFD0B0;  // light orange
+local int COLOR_BL2         = 0xB0FFD0;  // light green
+local int COLOR_DTB         = 0xB0D0FF;  // light blue
+local int COLOR_ZIMAGE      = 0xFFFFB0;  // light yellow
+local int COLOR_AUTH        = 0xFFB0B0;  // light red
+local int COLOR_TRAIL       = 0xD0D0D0;  // grey
+local int COLOR_DATA        = 0xF0F0F0;  // near-white
+local int COLOR_PAGE_DATA   = 0xFAFAFA;  // very light
+
+//------------------------------------------------
+// Section role flag read-string helpers
+//------------------------------------------------
+string ReadRoleFlags(uint32 f) {
+    local string s;
+    local string bits = "";
+
+    if (f & 0x0001) bits += "AUTH_COMPANION|";
+    if (f & 0x0080) bits += "ENTRY|";
+    if (f & 0x0800) bits += "OVERRIDE_DEST|";
+    if (f & 0x2000) bits += "SIG|";
+
+    if (Strlen(bits) > 0)
+        bits = SubStr(bits, 0, Strlen(bits) - 1);
+    else
+        bits = "NONE";
+
+    SPrintf(s, "0x%04X [%s]", f, bits);
+    return s;
+}
+
+string ReadImageType(uint32 f) {
+    local string s;
+    switch (f) {
+        case 0x00: SPrintf(s, "0x%X (plain/BL2)", f); break;
+        case 0x04: SPrintf(s, "0x%X (DTB)", f); break;
+        case 0x0A: SPrintf(s, "0x%X (zImage)", f); break;
+        default:   SPrintf(s, "0x%X (?)", f); break;
+    }
+    return s;
+}
+
+//------------------------------------------------
+// LBI Base Header (20 bytes) — at page 0, data offset 0
+//------------------------------------------------
+typedef struct {
+    uint32  magic <format=hex, comment="LBI magic: 0xBAD2BFED">;
+    uint32  format_version <comment="Format version (1)">;
+    uint32  header_size <format=hex,
+        comment="Total header size in logical bytes (base 20 + descriptors)">;
+    uint32  num_sections <comment="Number of section descriptors (5)">;
+    uint32  data_start <format=hex,
+        comment="Logical offset of first section data / alignment (0x800)">;
+} LBI_BASE_HEADER <bgcolor=COLOR_HEADER, comment="LBI base header">;
+
+//------------------------------------------------
+// Section Descriptor (24 bytes)
+//------------------------------------------------
+typedef struct {
+    uint32  role_flags <format=hex,
+        comment="Role: 0x80=ENTRY, 0x2000=SIG, 0x800=OVERRIDE_DEST, 0x01=AUTH_COMPANION">;
+    uint32  load_address <format=hex,
+        comment="Physical DRAM load address (0 = not loaded)">;
+    uint32  sec_size <format=hex,
+        comment="Section payload size in logical bytes (0 for auth block)">;
+    uint32  image_type <format=hex,
+        comment="Image type tag (toolchain metadata): 0x0=plain, 0x4=DTB, 0xA=zImage">;
+    uint32  entry_point <format=hex,
+        comment="Entry point (non-zero for BL2 only)">;
+    uint32  reserved <format=hex, comment="Reserved (0)">;
+} SECTION_DESCRIPTOR <bgcolor=COLOR_DESCRIPTOR>;
+
+string ReadSectionDesc(SECTION_DESCRIPTOR &d) {
+    local string s;
+    local string role;
+    if (d.role_flags & 0x0800)      role = "BMP";
+    else if (d.role_flags & 0x0080) role = "BL2";
+    else if (d.role_flags & 0x2000) role = "Auth";
+    else if (d.image_type == 0x04)  role = "DTB";
+    else if (d.image_type == 0x0A)  role = "zImage";
+    else                            role = "data";
+    SPrintf(s, "[%s] size=0x%X load=0x%08X", role, d.sec_size, d.load_address);
+    return s;
+}
+
+//------------------------------------------------
+// NAND OOB (64 bytes)
+//   12 bytes spare (typically 0xFF)
+//   4 × 13 bytes BCH ECC sectors
+//------------------------------------------------
+typedef struct {
+    uchar   spare[OOB_SPARE] <bgcolor=COLOR_OOB_SPARE,
+        comment="OOB spare area (12 bytes, typically 0xFF)">;
+    uchar   ecc_sector_0[OOB_ECC_SECT] <bgcolor=COLOR_OOB_ECC,
+        comment="BCH ECC sector 0 (13 bytes, covers data bytes 0-511)">;
+    uchar   ecc_sector_1[OOB_ECC_SECT] <bgcolor=COLOR_OOB_ECC,
+        comment="BCH ECC sector 1 (13 bytes, covers data bytes 512-1023)">;
+    uchar   ecc_sector_2[OOB_ECC_SECT] <bgcolor=COLOR_OOB_ECC,
+        comment="BCH ECC sector 2 (13 bytes, covers data bytes 1024-1535)">;
+    uchar   ecc_sector_3[OOB_ECC_SECT] <bgcolor=COLOR_OOB_ECC,
+        comment="BCH ECC sector 3 (13 bytes, covers data bytes 1536-2047)">;
+} NAND_OOB;
+
+string ReadOOB(NAND_OOB &o) {
+    local string s;
+    local int all_ff = 1;
+    local int k;
+    for (k = 0; k < OOB_SPARE; k++)
+        if (o.spare[k] != 0xFF) { all_ff = 0; break; }
+    if (all_ff) {
+        for (k = 0; k < OOB_ECC_SECT; k++)
+            if (o.ecc_sector_0[k] != 0xFF) { all_ff = 0; break; }
+    }
+    if (all_ff)
+        SPrintf(s, "erased (all 0xFF)");
+    else
+        SPrintf(s, "spare=%02X%02X..  ecc0=%02X%02X%02X%02X..",
+            o.spare[0], o.spare[1],
+            o.ecc_sector_0[0], o.ecc_sector_0[1],
+            o.ecc_sector_0[2], o.ecc_sector_0[3]);
+    return s;
+}
+
+//------------------------------------------------
+// Embedded Auth Block (320 bytes)
+//------------------------------------------------
+typedef struct {
+    uchar   algo_selector <comment="Algorithm type (0x02 = SHA-256 streaming)">;
+    uchar   crypto_provider <comment="Crypto provider ID (0x02)">;
+    uint32  coverage <format=hex,
+        comment="Streaming coverage in logical bytes, big-endian">;
+    uint16  key_index <format=hex,
+        comment="RSA key table index, big-endian">;
+    uint16  sig_length <format=hex,
+        comment="RSA signature length, big-endian (0x0100 = 256)">;
+    uchar   rsa_signature[256] <format=hex, bgcolor=0xFFB0B0,
+        comment="RSA-2048 signature (PKCS#1 v1.5)">;
+    uchar   padding[54] <bgcolor=0xE0E0E0,
+        comment="Zero padding (not fed to SecureBoot)">;
+} LBI_AUTH_BLOCK <bgcolor=COLOR_AUTH,
+    comment="Auth block (320 bytes: SecureBoot header + RSA-2048 sig)">;
+
+string ReadAuthBlock(LBI_AUTH_BLOCK &a) {
+    local string s;
+    SPrintf(s, "algo=%d provider=%d coverage=0x%08X key_idx=%d sig_len=%d",
+        a.algo_selector, a.crypto_provider, a.coverage,
+        a.key_index, a.sig_length);
+    return s;
+}
+
+//------------------------------------------------
+// NAND_PAGE_HEADER — Page 0 with LBI header parsed
+//
+// Contains the full LBI base header, section descriptor
+// table, padding to fill the 2048-byte data area, then
+// the 64-byte OOB.
+//------------------------------------------------
+typedef struct (int num_sec) {
+    // ── Data portion (2048 bytes) ──
+    LBI_BASE_HEADER hdr;
+    SECTION_DESCRIPTOR desc[num_sec] <read=ReadSectionDesc, optimize=false>;
+
+    // Padding from end of descriptors to end of data area
+    local int desc_end = sizeof(hdr) + num_sec * 24;
+    local int data_pad = PAGE_DATA - desc_end;
+    if (data_pad > 0) {
+        uchar header_padding[data_pad] <bgcolor=COLOR_PADDING,
+            comment="Padding to end of page 0 data area (0xFF on NAND)">;
+    }
+
+    // ── OOB portion (64 bytes) ──
+    NAND_OOB oob <read=ReadOOB, comment="Page 0 OOB (BCH ECC)">;
+} NAND_PAGE_HEADER;
+
+string ReadPageHeader(NAND_PAGE_HEADER &p) {
+    local string s;
+    SPrintf(s, "LBI hdr: magic=0x%08X ver=%d sections=%d data_start=0x%X",
+        p.hdr.magic, p.hdr.format_version,
+        p.hdr.num_sections, p.hdr.data_start);
+    return s;
+}
+
+//------------------------------------------------
+// NAND_PAGE_GENERIC — a plain data page + OOB
+//
+// Used for pages that are part of section payloads,
+// alignment padding, or trailing fill.
+//------------------------------------------------
+typedef struct (string label) {
+    local string page_label = label;
+    uchar data[PAGE_DATA] <bgcolor=COLOR_PAGE_DATA>;
+    NAND_OOB oob <read=ReadOOB>;
+} NAND_PAGE_GENERIC;
+
+string ReadPageGeneric(NAND_PAGE_GENERIC &p) {
+    local string s;
+    local int pg = startof(p) / PAGE_RAW;
+    local int blk = pg / PAGES_PER_BLK;
+    local int pg_in_blk = pg % PAGES_PER_BLK;
+    SPrintf(s, "page %d (blk %d pg %d) -- %s",
+        pg, blk, pg_in_blk, p.page_label);
+    return s;
+}
+
+//------------------------------------------------
+// SECTION_FIRST_PAGE_BMP — first page of BMP section
+// Parses the BMP header from within the data area.
+//------------------------------------------------
+typedef struct {
+    LittleEndian();
+    char    bmp_magic[2] <comment="BMP magic 'BM'">;
+    uint32  bmp_file_size <comment="BMP file size">;
+    uint16  bmp_rsv1;
+    uint16  bmp_rsv2;
+    uint32  bmp_pixel_off <comment="Offset to pixel data">;
+    uint32  bmp_dib_size <comment="DIB header size (40)">;
+    int32   bmp_width <comment="Width (px)">;
+    int32   bmp_height <comment="Height (px)">;
+    uint16  bmp_planes;
+    uint16  bmp_bpp <comment="Bits per pixel">;
+    uint32  bmp_compress <comment="Compression">;
+    uint32  bmp_raw_size <comment="Raw image data size">;
+    int32   bmp_xppm <comment="X pixels per meter">;
+    int32   bmp_yppm <comment="Y pixels per meter">;
+    uint32  bmp_colors <comment="Colors in table">;
+    uint32  bmp_important <comment="Important colors">;
+    BigEndian();
+    // Remaining data bytes in this page
+    uchar   page_data_rest[PAGE_DATA - 54] <bgcolor=COLOR_BMP,
+        comment="BMP pixel data (first page)">;
+    // OOB
+    NAND_OOB oob <read=ReadOOB>;
+} SECTION_FIRST_PAGE_BMP <bgcolor=COLOR_BMP>;
+
+string ReadFirstPageBMP(SECTION_FIRST_PAGE_BMP &p) {
+    local string s;
+    SPrintf(s, "BMP %dx%d %d-bpp, file_size=%d",
+        p.bmp_width, p.bmp_height, p.bmp_bpp, p.bmp_file_size);
+    return s;
+}
+
+//------------------------------------------------
+// SECTION_FIRST_PAGE_BL2 — first page of BL2 section
+//------------------------------------------------
+typedef struct {
+    uchar   code[PAGE_DATA] <bgcolor=COLOR_BL2,
+        comment="BL2 code (Thumb-2 LE ARM32, first 2048 bytes)">;
+    NAND_OOB oob <read=ReadOOB>;
+} SECTION_FIRST_PAGE_BL2 <bgcolor=COLOR_BL2>;
+
+string ReadFirstPageBL2(SECTION_FIRST_PAGE_BL2 &p) {
+    local string s;
+    SPrintf(s, "BL2 first page: %02X %02X %02X %02X ...",
+        p.code[0], p.code[1], p.code[2], p.code[3]);
+    return s;
+}
+
+//------------------------------------------------
+// SECTION_FIRST_PAGE_DTB — first page of DTB section
+//------------------------------------------------
+typedef struct {
+    BigEndian();
+    uint32  fdt_magic <format=hex, comment="FDT magic: 0xD00DFEED">;
+    uint32  fdt_totalsize <comment="Total DTB size">;
+    uint32  fdt_off_struct <format=hex>;
+    uint32  fdt_off_strings <format=hex>;
+    uint32  fdt_off_rsvmap <format=hex>;
+    uint32  fdt_version <comment="FDT version (17)">;
+    uint32  fdt_last_comp <comment="Last compatible version">;
+    uint32  fdt_boot_cpu <comment="Boot CPU phys ID">;
+    uint32  fdt_sz_strings <comment="Strings block size">;
+    uint32  fdt_sz_struct <comment="Struct block size">;
+    uchar   page_data_rest[PAGE_DATA - 40] <bgcolor=COLOR_DTB,
+        comment="DTB data (first page remainder)">;
+    NAND_OOB oob <read=ReadOOB>;
+} SECTION_FIRST_PAGE_DTB <bgcolor=COLOR_DTB>;
+
+string ReadFirstPageDTB(SECTION_FIRST_PAGE_DTB &p) {
+    local string s;
+    SPrintf(s, "DTB: magic=0x%08X totalsize=%d ver=%d",
+        p.fdt_magic, p.fdt_totalsize, p.fdt_version);
+    return s;
+}
+
+//------------------------------------------------
+// SECTION_FIRST_PAGE_ZIMAGE — first page of zImage
+//------------------------------------------------
+typedef struct {
+    LittleEndian();
+    uchar   z_stub[0x24] <comment="ARM decompressor stub">;
+    uint32  z_magic <format=hex, comment="zImage magic 0x016F2818">;
+    uint32  z_start <format=hex, comment="Kernel start offset">;
+    uint32  z_end <format=hex, comment="Kernel end offset">;
+    BigEndian();
+    uchar   page_data_rest[PAGE_DATA - 0x30] <bgcolor=COLOR_ZIMAGE,
+        comment="zImage data (first page remainder)">;
+    NAND_OOB oob <read=ReadOOB>;
+} SECTION_FIRST_PAGE_ZIMAGE <bgcolor=COLOR_ZIMAGE>;
+
+string ReadFirstPageZImage(SECTION_FIRST_PAGE_ZIMAGE &p) {
+    local string s;
+    local int kern_size;
+    kern_size = p.z_end - p.z_start;
+    SPrintf(s, "zImage: magic=0x%08X start=0x%X end=0x%X (kernel ~%d KB)",
+        p.z_magic, p.z_start, p.z_end, kern_size / 1024);
+    return s;
+}
+
+//------------------------------------------------
+// SECTION_AUTH_PAGE — auth block (fits in one page)
+// The auth block is 320 bytes; 2048 - 320 = 1728 bytes
+// of trailing padding within the page.
+//------------------------------------------------
+typedef struct {
+    LBI_AUTH_BLOCK auth <read=ReadAuthBlock>;
+    uchar   page_data_rest[PAGE_DATA - 320] <bgcolor=COLOR_PADDING,
+        comment="Remaining page data after auth block (0xFF fill)">;
+    NAND_OOB oob <read=ReadOOB>;
+} SECTION_AUTH_PAGE <bgcolor=COLOR_AUTH>;
+
+string ReadAuthPage(SECTION_AUTH_PAGE &p) {
+    local string s;
+    SPrintf(s, "Auth: algo=%d provider=%d coverage=0x%08X sig_len=%d",
+        p.auth.algo_selector, p.auth.crypto_provider,
+        p.auth.coverage, p.auth.sig_length);
+    return s;
+}
+
+//------------------------------------------------
+// SECTION_PAGES — a run of pages belonging to one
+// LBI section.  The first page is parsed with a
+// format-specific header; remaining pages are generic.
+//
+// Parameters:
+//   sec_idx        — section index
+//   role           — role_flags
+//   attr           — image_type
+//   logical_size   — sec_size from descriptor (logical bytes)
+//   logical_start  — logical offset of section start
+//   page_count     — total pages this section spans
+//------------------------------------------------
+typedef struct (int sec_idx, uint32 role, uint32 attr,
+                uint32 logical_size, int logical_start,
+                int page_count)
+{
+    local int sec_index = sec_idx;
+    local int num_pages = page_count;
+    local uint32 log_size = logical_size;
+    local int log_start = logical_start;
+
+    // Determine section name for labels
+    local string sec_name;
+    if (role & 0x0800)      sec_name = "BMP";
+    else if (role & 0x0080) sec_name = "BL2";
+    else if (role & 0x2000) sec_name = "Auth";
+    else if (attr == 0x04)  sec_name = "DTB";
+    else if (attr == 0x0A)  sec_name = "zImage";
+    else                    sec_name = "data";
+
+    // ── First page: format-specific header parsing ──
+    if (role & 0x0800) {
+        SECTION_FIRST_PAGE_BMP first_page <read=ReadFirstPageBMP>;
+    } else if (role & 0x0080) {
+        SECTION_FIRST_PAGE_BL2 first_page <read=ReadFirstPageBL2>;
+    } else if (role & 0x2000) {
+        SECTION_AUTH_PAGE first_page <read=ReadAuthPage>;
+    } else if (attr == 0x04) {
+        SECTION_FIRST_PAGE_DTB first_page <read=ReadFirstPageDTB>;
+    } else if (attr == 0x0A) {
+        SECTION_FIRST_PAGE_ZIMAGE first_page <read=ReadFirstPageZImage>;
+    } else if (page_count > 0) {
+        local string lbl;
+        SPrintf(lbl, "%s (first page)", sec_name);
+        NAND_PAGE_GENERIC first_page(lbl) <read=ReadPageGeneric>;
+    }
+
+    // ── Remaining pages: generic data + OOB ──
+    local int p;
+    local string pg_label;
+    if (page_count > 1) {
+        for (p = 1; p < page_count; p++) {
+            SPrintf(pg_label, "%s pg %d/%d", sec_name, p + 1, page_count);
+            NAND_PAGE_GENERIC page(pg_label) <read=ReadPageGeneric>;
+        }
+    }
+} SECTION_PAGES;
+
+string ReadSectionPages(SECTION_PAGES &s) {
+    local string str;
+    SPrintf(str, "[%d] %s: %d pages, logical=0x%06X size=0x%X",
+        s.sec_index, s.sec_name, s.num_pages,
+        s.log_start, s.log_size);
+    return str;
+}
+
+//==========================================================
+// PARSE
+//==========================================================
+
+// ── Validate file is OOB-interleaved ──
+if (FileSize() % PAGE_RAW != 0) {
+    Printf("WARNING: File size %d is not a multiple of %d.\n",
+        FileSize(), PAGE_RAW);
+    Printf("This file may not be an OOB-interleaved ULBI image.\n");
+    Printf("Try HP_Dune_Selene_LBI.bt for data-only LBI images.\n");
+}
+
+// ── Read magic before committing ──
+local uint32 check_magic = ReadUInt(0);
+if (check_magic != 0xBAD2BFED) {
+    Warning("Bad LBI magic: 0x%08X (expected 0xBAD2BFED)", check_magic);
+    Printf("ERROR: Bad LBI magic 0x%08X at offset 0.\n", check_magic);
+    return;
+}
+
+// ── Peek at the number of sections for the header struct ──
+local int num_sections_peek = ReadUInt(12);
+if (num_sections_peek < 1 || num_sections_peek > 20) {
+    Warning("Suspicious section count: %d", num_sections_peek);
+}
+
+// ── Page 0: LBI header page ──
+NAND_PAGE_HEADER page0(num_sections_peek) <read=ReadPageHeader,
+    comment="Page 0: LBI header + descriptors + OOB">;
+
+// ── Validate descriptor table ──
+local int i;
+local int entry_count = 0;
+local int entry_idx = -1;
+for (i = 0; i < page0.hdr.num_sections; i++) {
+    if (page0.desc[i].role_flags & 0x0080) {
+        entry_count++;
+        entry_idx = i;
+    }
+}
+if (entry_count == 0)
+    Warning("No ENTRY (0x80) section found -- expected exactly one (BL2).");
+else if (entry_count > 1)
+    Warning("Multiple ENTRY (0x80) sections found (%d).", entry_count);
+
+if (page0.hdr.num_sections > 0) {
+    local uint32 last_role = page0.desc[page0.hdr.num_sections - 1].role_flags;
+    if (!(last_role & 0x2000))
+        Warning("Last section does not have SIG flag (0x2000).");
+}
+
+// ── Compute section physical offsets and page ranges ──
+//
+// logical_offset → physical_page:
+//   physical_page = logical_offset / PAGE_DATA
+//   physical_file_offset = physical_page * PAGE_RAW
+//
+// Section sizes in the descriptor are logical bytes.  A section
+// occupying N logical bytes spans ceil(N / PAGE_DATA) pages
+// when it starts at a page-aligned logical offset.
+
+local int ds = page0.hdr.data_start;                // alignment (0x800)
+local int sec_logical = ds;                          // first section logical offset
+local int sec_pages;
+local int sec_phys_page;
+local int sec_phys_file_off;
+local int sec_log_size;
+local int sec_end_logical;
+local int sec_next_logical;
+local int in_page_offset;
+local int bytes_from_page_start;
+local int next_sec_page;
+local int after_sec_page;
+local int gap_pages;
+local int g;
+local string gap_lbl;
+
+// ── Parse padding pages between header and data_start ──
+// Page 0 data covers logical bytes 0x000–0x7FF (2048 bytes).
+// If data_start is 0x800, that's exactly the start of page 1 — no gap.
+// If data_start > 0x800, there are padding pages between.
+local int first_data_page = ds / PAGE_DATA;
+local int pad_pages;
+local string pad_lbl;
+if (first_data_page > 1) {
+    pad_pages = first_data_page - 1;
+    for (i = 1; i < first_data_page; i++) {
+        FSeek(i * PAGE_RAW);
+        SPrintf(pad_lbl, "header padding (page %d)", i);
+        NAND_PAGE_GENERIC header_pad_page(pad_lbl)
+            <read=ReadPageGeneric, comment="Padding between header and data_start">;
+    }
+}
+
+// ── Section payloads ──
+for (i = 0; i < page0.hdr.num_sections; i++) {
+    // Compute logical size (auth block is 320 bytes despite descriptor saying 0)
+    sec_log_size = page0.desc[i].sec_size;
+    if (sec_log_size == 0 && (page0.desc[i].role_flags & 0x2000))
+        sec_log_size = 320;
+
+    // Compute page range
+    sec_phys_page = sec_logical / PAGE_DATA;
+    sec_phys_file_off = sec_phys_page * PAGE_RAW;
+
+    // Pages spanned: ceiling division, but at least 1 if there's data
+    if (sec_log_size > 0) {
+        // How many bytes from the start of the first page to the end of the section?
+        in_page_offset = sec_logical % PAGE_DATA;  // should be 0 for aligned sections
+        bytes_from_page_start = in_page_offset + sec_log_size;
+        sec_pages = (bytes_from_page_start + PAGE_DATA - 1) / PAGE_DATA;
+    } else {
+        sec_pages = 0;
+    }
+
+    // Seek and parse
+    if (sec_pages > 0) {
+        FSeek(sec_phys_file_off);
+        SECTION_PAGES section(i, page0.desc[i].role_flags,
+                              page0.desc[i].image_type,
+                              page0.desc[i].sec_size,
+                              sec_logical, sec_pages)
+            <read=ReadSectionPages,
+             comment="Section pages (data + OOB per page)">;
+    }
+
+    // Advance to next section (logical alignment)
+    sec_end_logical = sec_logical + sec_log_size;
+    sec_next_logical = ((sec_end_logical + ds - 1) / ds) * ds;
+
+    // Parse alignment padding pages between sections
+    next_sec_page = sec_next_logical / PAGE_DATA;
+    after_sec_page = sec_phys_page + sec_pages;
+    if (next_sec_page > after_sec_page) {
+        gap_pages = next_sec_page - after_sec_page;
+        for (g = 0; g < gap_pages; g++) {
+            FSeek((after_sec_page + g) * PAGE_RAW);
+            SPrintf(gap_lbl, "alignment pad (between sec %d and %d)", i, i + 1);
+            NAND_PAGE_GENERIC align_pad(gap_lbl)
+                <read=ReadPageGeneric, comment="Alignment padding page">;
+        }
+    }
+
+    sec_logical = sec_next_logical;
+}
+
+// -- Trailing pages --
+local int current_pos = FTell();
+local int trail_bytes = FileSize() - current_pos;
+local int trail_pages;
+local int trail_rem;
+local int t;
+local string trail_lbl;
+if (trail_bytes > 0) {
+    trail_pages = trail_bytes / PAGE_RAW;
+    trail_rem = trail_bytes % PAGE_RAW;
+    for (t = 0; t < trail_pages; t++) {
+        SPrintf(trail_lbl, "trailing fill (page %d/%d)", t + 1, trail_pages);
+        NAND_PAGE_GENERIC trailing(trail_lbl)
+            <read=ReadPageGeneric, bgcolor=COLOR_TRAIL,
+             comment="Trailing partition fill (0xFF) + OOB">;
+    }
+    // Handle any remaining partial data (shouldn't happen for valid files)
+    if (trail_rem > 0) {
+        uchar trailing_fragment[trail_rem] <bgcolor=COLOR_TRAIL,
+            comment="Trailing partial page (unexpected)">;
+    }
+}
+
+//==========================================================
+// Output window summary
+//==========================================================
+Printf("=== HP ULBI (OOB-Interleaved LBI) ===\n");
+Printf("\n");
+Printf("  === NAND Page Layout ===\n");
+Printf("  Page size:    %d bytes (%d data + %d OOB)\n",
+    PAGE_RAW, PAGE_DATA, PAGE_OOB);
+Printf("  OOB layout:   %d spare + %d x %d BCH ECC\n",
+    OOB_SPARE, OOB_ECC_CNT, OOB_ECC_SECT);
+Printf("  Total pages:  %d", TOTAL_PAGES);
+if (TOTAL_PAGES_REM == 0)
+    Printf(" (%d complete blocks)\n", TOTAL_BLOCKS_FULL);
+else
+    Printf(" (%d blocks + %d pages)\n", TOTAL_BLOCKS_FULL, TOTAL_PAGES_REM);
+Printf("  File size:    %d bytes (0x%X)\n", FileSize(), FileSize());
+Printf("  Data only:    %d bytes (0x%X)\n",
+    TOTAL_PAGES * PAGE_DATA, TOTAL_PAGES * PAGE_DATA);
+Printf("  OOB total:    %d bytes\n", TOTAL_PAGES * PAGE_OOB);
+Printf("\n");
+
+Printf("  === LBI Header ===\n");
+Printf("  Magic:        0x%08X%s\n", page0.hdr.magic,
+    page0.hdr.magic == 0xBAD2BFED ? " (valid)" : " (INVALID!)");
+Printf("  Version:      %d\n", page0.hdr.format_version);
+Printf("  Header size:  0x%X (%d logical bytes)\n",
+    page0.hdr.header_size, page0.hdr.header_size);
+Printf("  Sections:     %d\n", page0.hdr.num_sections);
+Printf("  Data start:   0x%X (logical) -> page %d (physical 0x%X)\n",
+    page0.hdr.data_start,
+    page0.hdr.data_start / PAGE_DATA,
+    (page0.hdr.data_start / PAGE_DATA) * PAGE_RAW);
+Printf("\n");
+
+Printf("  === Validation ===\n");
+if (entry_count == 1)
+    Printf("  ENTRY sections:  %d (OK, section #%d)\n", entry_count, entry_idx);
+else
+    Printf("  ENTRY sections:  %d (FAIL -- expected exactly 1)\n", entry_count);
+
+if (page0.hdr.num_sections > 0 &&
+    (page0.desc[page0.hdr.num_sections - 1].role_flags & 0x2000))
+    Printf("  Last is SIG:     yes (OK)\n");
+else
+    Printf("  Last is SIG:     no (FAIL)\n");
+
+// Check file size is multiple of page size
+if (FileSize() % PAGE_RAW == 0)
+    Printf("  Page alignment:  yes (OK, %d pages)\n", TOTAL_PAGES);
+else
+    Printf("  Page alignment:  no (FAIL, %d remainder bytes)\n",
+        FileSize() % PAGE_RAW);
+
+Printf("\n");
+
+Printf("  === Section Table ===\n");
+Printf("  %-3s %-10s %-10s %-10s %-6s %-10s %-8s\n",
+    "#", "Flags", "Load", "Size", "Attr", "Entry", "Role");
+
+local int log_off = page0.hdr.data_start;
+local string role;
+local int sz;
+local int end_pos;
+local int phys_page;
+local int phys_off;
+
+for (i = 0; i < page0.hdr.num_sections; i++) {
+    if (page0.desc[i].role_flags & 0x0800)      role = "BMP splash";
+    else if (page0.desc[i].role_flags & 0x0080) role = "BL2";
+    else if (page0.desc[i].role_flags & 0x2000) role = "Auth block";
+    else if (page0.desc[i].image_type == 0x04)  role = "DTB";
+    else if (page0.desc[i].image_type == 0x0A)  role = "zImage";
+    else                                        role = "data";
+
+    sz = page0.desc[i].sec_size;
+    if (sz == 0 && (page0.desc[i].role_flags & 0x2000)) sz = 320;
+
+    phys_page = log_off / PAGE_DATA;
+    phys_off = phys_page * PAGE_RAW;
+
+    Printf("  %-3d 0x%08X 0x%08X 0x%08X 0x%-4X 0x%08X %s\n",
+        i, page0.desc[i].role_flags, page0.desc[i].load_address,
+        page0.desc[i].sec_size, page0.desc[i].image_type,
+        page0.desc[i].entry_point, role);
+    Printf("      logical=0x%06X  physical=0x%06X  page=%d  pages=%d\n",
+        log_off, phys_off, phys_page,
+        (sz + PAGE_DATA - 1) / PAGE_DATA);
+
+    end_pos = log_off + sz;
+    log_off = ((end_pos + ds - 1) / ds) * ds;
+}
+
+Printf("\n");
+Printf("  === Layout Map (Logical <-> Physical) ===\n");
+Printf("  %-16s %-10s %-10s %-8s %-8s\n",
+    "Region", "Logical", "Physical", "Size", "Pages");
+
+log_off = 0;
+Printf("  %-16s 0x%06X   0x%06X   %-8d %d\n",
+    "LBI header", log_off,
+    0, page0.hdr.header_size, 1);
+
+log_off = page0.hdr.data_start;
+for (i = 0; i < page0.hdr.num_sections; i++) {
+    if (page0.desc[i].role_flags & 0x0800)      role = "Boot logo BMP";
+    else if (page0.desc[i].role_flags & 0x0080) role = "BL2";
+    else if (page0.desc[i].role_flags & 0x2000) role = "Auth block";
+    else if (page0.desc[i].image_type == 0x04)  role = "DTB";
+    else if (page0.desc[i].image_type == 0x0A)  role = "Kernel zImage";
+    else                                        role = "section";
+
+    sz = page0.desc[i].sec_size;
+    if (sz == 0 && (page0.desc[i].role_flags & 0x2000)) sz = 320;
+
+    phys_page = log_off / PAGE_DATA;
+    phys_off = phys_page * PAGE_RAW;
+
+    Printf("  %-16s 0x%06X   0x%06X   %-8d %d\n",
+        role, log_off, phys_off, sz,
+        (sz + PAGE_DATA - 1) / PAGE_DATA);
+
+    end_pos = log_off + sz;
+    log_off = ((end_pos + ds - 1) / ds) * ds;
+}
+
+// Trailing
+phys_page = log_off / PAGE_DATA;
+phys_off = phys_page * PAGE_RAW;
+Printf("  %-16s 0x%06X   0x%06X   %-8d %d\n",
+    "Trailing fill", log_off, phys_off,
+    TOTAL_PAGES * PAGE_DATA - log_off,
+    TOTAL_PAGES - phys_page);
+
+Printf("\n");
+Printf("  NOTE: To parse this file with HP_Dune_Selene_LBI.bt,\n");
+Printf("  strip OOB first: extract 2048 of every 2112 bytes.\n");
+Printf("  Stripped size: %d bytes.\n", TOTAL_PAGES * PAGE_DATA);

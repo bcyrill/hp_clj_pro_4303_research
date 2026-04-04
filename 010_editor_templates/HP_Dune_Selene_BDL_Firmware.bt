@@ -1,0 +1,335 @@
+//------------------------------------------------
+// HP BDL (Bundle) Firmware Update File Format
+// 010 Editor Binary Template
+//
+// Target: HP Color LaserJet Pro MFP 4301-4303 series
+// Sample: HP_Color_LaserJet_Pro_MFP_4301-4303_Firmware_6.28.1.35-202511201716.bdl
+//
+// Format layers:
+//   BDL Header → Package Table → ipkg Packages → Signature Block
+//
+// Structure recovery methodology:
+//   - RTTI typeinfo/vtable analysis from libframework.so
+//   - ARM Thumb disassembly (Capstone) of BundleHelper, BundleDownloader
+//   - CRC-32 verification against real firmware
+//   - On-disk correlation of all header fields
+//
+// References:
+//   - BDL_Format_Documentation.md (primary format specification)
+//   - HP_Dune_Selene_Firmware_Update.md (system-level documentation)
+//
+// Note: All multi-byte integers are little-endian.
+//       Headers require packed alignment (#pragma pack(push, 1) in C).
+//       The _pad0 byte at 0x328 (BDL) / 0x33C (ipkg) causes subsequent
+//       fields to be unaligned.
+//------------------------------------------------
+
+BigEndian();
+LittleEndian();
+
+//---------- Color definitions ----------
+
+local int clrCommonHdr    = 0xADD8E6;  // Light blue (shared header)
+local int clrBdlExtended  = 0xB0C4DE;  // Light steel blue (BDL-specific)
+local int clrPkgTable     = 0x98FB98;  // Pale green
+local int clrIpkgExtended = 0xFFDAB9;  // Peach puff (ipkg-specific)
+local int clrFileTable    = 0xDDA0DD;  // Plum
+local int clrDigests      = 0xFFFFE0;  // Light yellow
+local int clrEncPayload   = 0xFFB6C1;  // Light pink
+local int clrSignature    = 0xFFA07A;  // Light salmon
+
+//---------- CommonHeader (0x320 = 800 bytes) ----------
+// Shared prefix for both BdlHeader and PakHeader.
+// IHeader interface provides read-only access; IMutableHeader adds setters.
+
+typedef struct {
+    char     magic[4]           <comment="'ibdl' for bundles, 'ipkg' for packages">;
+    uint16   versionMajor       <comment="Format version major">;
+    uint16   versionMinor       <comment="Format version minor">;
+    uint32   headerSize         <comment="Total header struct size in bytes">;
+    uint32   headerCrc          <comment="CRC-32 of header (excluding this field itself)">;
+    uint32   itemCount          <comment="Sub-item count (packages for BDL, files for ipkg)">;
+    uint32   itemTableCrc       <comment="CRC-32 of the item table following the header">;
+    uint32   timestamp          <comment="Unix epoch build timestamp">;
+    uint32   reserved           <comment="Always 0">;
+    char     versionString[256] <comment="Firmware version string (e.g. 6.28.1.35-202511201716)">;
+    char     vendor[256]        <comment="Vendor string (e.g. HP)">;
+    char     name[256]          <comment="Name: model list (BDL) or package name (ipkg)">;
+} COMMON_HEADER <bgcolor=clrCommonHdr>;
+
+//---------- BDL Header (0x929 = 2345 bytes) ----------
+// Extends CommonHeader with bundle-specific fields.
+// C++ class: BundleHeader → HeaderT<BdlHeader> → IMutableHeader → IHeader
+
+typedef struct {
+    COMMON_HEADER common          <comment="CommonHeader (magic='ibdl')">;
+    uint32   type                 <comment="Bundle type (e.g. 0x300)">;
+    uint32   options              <comment="Bundle options bitmask">;
+    uchar    _pad0                <comment="Alignment byte (always 0)">;
+    char     description[256]     <comment="Bundle description">;
+    char     identifier[256]      <comment="Bundle identifier (e.g. 706D66-0005)">;
+    char     supportUrl[256]      <comment="Support URL">;
+    char     supportPhone[256]    <comment="Support phone number">;
+    char     supportEmail[256]    <comment="Support email address">;
+    char     serialNumber[256]    <comment="Serial number">;
+} BDL_HEADER <bgcolor=clrBdlExtended>;
+
+//---------- Package Table Entry (16 bytes) ----------
+
+typedef struct {
+    uint64   offset              <comment="Byte offset from start of BDL file to PakHeader">;
+    uint64   size                <comment="Total package size (PakHeader + FileTable + file data)">;
+} PACKAGE_ENTRY <read=ReadPackageEntry, bgcolor=clrPkgTable>;
+
+string ReadPackageEntry(PACKAGE_ENTRY &e) {
+    string s;
+    SPrintf(s, "offset=0x%LX size=0x%LX (%Ld bytes)", e.offset, e.size, e.size);
+    return s;
+}
+
+//---------- ipkg File Table Entry (0x114 = 276 bytes) ----------
+
+typedef struct {
+    char     fileName[256]       <comment="Null-terminated filename">;
+    uint64   fileOffset          <comment="File offset relative to start of containing package">;
+    uint64   fileSize            <comment="File size in bytes">;
+    uint32   crc32               <comment="CRC-32 of file content">;
+} FILE_TABLE_ENTRY <read=ReadFileTableEntry, bgcolor=clrFileTable>;
+
+string ReadFileTableEntry(FILE_TABLE_ENTRY &e) {
+    string s;
+    SPrintf(s, "\"%s\" offset=0x%LX size=%Ld crc=0x%08X", e.fileName, e.fileOffset, e.fileSize, e.crc32);
+    return s;
+}
+
+//---------- ipkg Header (0x43D = 1085 bytes) ----------
+// Extends CommonHeader with package-specific fields.
+// C++ class: PackageHeader → HeaderT<PakHeader> → IMutablePackageHeader → IPackageHeader
+//
+// Known package type UUIDs (RFC 4122 mixed-endian on disk):
+//   LBI:     9d33cb83-bdf6-e040-8c45-59e409579b58  (flags 0x0)
+//   ROOTFS:  9d33cb83-bdf6-e040-8c45-59e409579b59  (flags 0x3)
+//   DATAFS:  9d33cb83-bdf6-e040-8c45-59e409579b5a  (flags 0x3)
+//   ECLIPSE: f50ecc25-2672-5c46-9f0a-190aaaef9175  (flags 0x0)
+
+typedef struct {
+    COMMON_HEADER common          <comment="CommonHeader (magic='ipkg')">;
+    uchar    typeUuid[16]         <comment="Package type UUID (16 bytes, RFC 4122 mixed-endian)">;
+    uint32   installOptions       <comment="Install options bitmask (e.g. 0x17F)">;
+    uint32   installPhase         <comment="Installation phase">;
+    uint32   packageOptions       <comment="Package options bitmask">;
+    uchar    _pad0                <comment="Alignment byte (always 0)">;
+    char     description[256]     <comment="Package description">;
+} IPKG_HEADER <bgcolor=clrIpkgExtended>;
+
+//---------- Encrypted payload (.gtx1) ----------
+// AES-256-CBC encrypted firmware data.
+// Key material is in digests.txt (KVP format: filename=hex_aes_key).
+// DecryptingFileWriter reads 16-byte IV, then decrypts remaining data.
+// PKCS#7 padding. No embedded CRC — FileTableEntry.crc32 covers entire file.
+
+typedef struct (uint64 payloadSize) {
+    uchar    iv[16]              <comment="AES-256-CBC initialization vector", bgcolor=0xFF6347>;
+    if (payloadSize > 16) {
+        uchar    ciphertext[payloadSize - 16] <comment="AES-256-CBC encrypted data (PKCS#7 padded)">;
+    }
+} GTX1_PAYLOAD <bgcolor=clrEncPayload>;
+
+//---------- Plaintext digests/keys file ----------
+// KvpFile format: key=value pairs, one per line.
+// Contains AES-256 keys for encrypted firmware files.
+// Format:
+//   version=1.0
+//   Ulbi.bin.gtx1=<64 hex chars = 32-byte AES key>
+// Keys are in plaintext — encryption serves as integrity/authenticity layer,
+// not confidentiality (used with HP CSS signatures).
+
+typedef struct (uint64 fileSize) {
+    char     content[fileSize]   <comment="KVP: version + AES-256 keys for .gtx1 files">;
+} DIGESTS_FILE <bgcolor=clrDigests>;
+
+//---------- HP Signature Block ----------
+
+typedef struct (int blockSize) {
+    char     data[blockSize]     <comment="HP CSS signature block">;
+} SIGNATURE_BLOCK <bgcolor=clrSignature>;
+
+//---------- ipkg Package (header + file table + file data) ----------
+
+typedef struct (uint64 pkgSize) {
+    local int64 pkgStart = FTell();
+
+    IPKG_HEADER header;
+
+    // File table: itemCount entries of 0x114 bytes each
+    local int i;
+    for (i = 0; i < header.common.itemCount; i++) {
+        FILE_TABLE_ENTRY fileEntry;
+    }
+
+    // File data for each entry
+    local int64 fileAbsOffset;
+    local uint64 fileSize;
+    local string fname;
+
+    for (i = 0; i < header.common.itemCount; i++) {
+        fileAbsOffset = pkgStart + fileEntry[i].fileOffset;
+        fileSize = fileEntry[i].fileSize;
+        fname = fileEntry[i].fileName;
+
+        FSeek(fileAbsOffset);
+
+        if (Strstr(fname, "digests.txt") >= 0) {
+            DIGESTS_FILE digestsFile(fileSize) <comment="digests.txt — AES keys">;
+        }
+        else if (Strstr(fname, ".gtx1") >= 0) {
+            GTX1_PAYLOAD encryptedPayload(fileSize) <comment="AES-256-CBC encrypted firmware">;
+        }
+        else {
+            struct {
+                uchar data[fileSize];
+            } unknownFile <comment="Unknown file type">;
+        }
+    }
+} IPKG_PACKAGE;
+
+//==========================================================
+//  Main parsing
+//==========================================================
+
+// 1. BDL Header (0x929 bytes at offset 0)
+FSeek(0);
+BDL_HEADER bdlHeader <comment="BDL Bundle Header">;
+
+// Validate magic
+if (bdlHeader.common.magic != "ibdl") {
+    Warning("Invalid BDL magic: expected 'ibdl'");
+    return;
+}
+
+Printf("=== BDL Bundle Header ===\n");
+Printf("Format Version: %d.%d\n", bdlHeader.common.versionMajor, bdlHeader.common.versionMinor);
+Printf("Header Size: 0x%X (%d bytes)\n", bdlHeader.common.headerSize, bdlHeader.common.headerSize);
+Printf("Header CRC: 0x%08X\n", bdlHeader.common.headerCrc);
+Printf("Package Count: %d\n", bdlHeader.common.itemCount);
+Printf("Item Table CRC: 0x%08X\n", bdlHeader.common.itemTableCrc);
+Printf("Build Timestamp: %u\n", bdlHeader.common.timestamp);
+Printf("Version: %s\n", bdlHeader.common.versionString);
+Printf("Vendor: %s\n", bdlHeader.common.vendor);
+Printf("Name: %s\n", bdlHeader.common.name);
+Printf("Type: 0x%X\n", bdlHeader.type);
+Printf("Options: 0x%X\n", bdlHeader.options);
+Printf("Description: %s\n", bdlHeader.description);
+Printf("Identifier: %s\n", bdlHeader.identifier);
+if (bdlHeader.supportUrl[0] != 0)
+    Printf("Support URL: %s\n", bdlHeader.supportUrl);
+if (bdlHeader.supportPhone[0] != 0)
+    Printf("Support Phone: %s\n", bdlHeader.supportPhone);
+if (bdlHeader.supportEmail[0] != 0)
+    Printf("Support Email: %s\n", bdlHeader.supportEmail);
+if (bdlHeader.serialNumber[0] != 0)
+    Printf("Serial Number: %s\n", bdlHeader.serialNumber);
+Printf("\n");
+
+// 2. Package Table (immediately after BDL header)
+FSeek(bdlHeader.common.headerSize);
+struct {
+    PACKAGE_ENTRY entries[bdlHeader.common.itemCount];
+} packageTable <comment="Package offset/size table">;
+
+// 3. Packages
+local int p;
+local uint64 pSize;
+local int fi;
+local string typeUuidStr;
+for (p = 0; p < bdlHeader.common.itemCount; p++) {
+    FSeek(packageTable.entries[p].offset);
+    pSize = packageTable.entries[p].size;
+
+    IPKG_PACKAGE package(pSize) <comment="ipkg firmware package">;
+
+    Printf("=== Package %d ===\n", p);
+    Printf("  Offset: 0x%LX\n", packageTable.entries[p].offset);
+    Printf("  Size:   0x%LX (%Ld bytes)\n", pSize, pSize);
+    Printf("  Name:        %s\n", package.header.common.name);
+    Printf("  Description: %s\n", package.header.description);
+    Printf("  Version:     %s\n", package.header.common.versionString);
+    Printf("  Header CRC:  0x%08X\n", package.header.common.headerCrc);
+    Printf("  File Table CRC: 0x%08X\n", package.header.common.itemTableCrc);
+
+    // Format UUID
+    SPrintf(typeUuidStr, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        package.header.typeUuid[0], package.header.typeUuid[1],
+        package.header.typeUuid[2], package.header.typeUuid[3],
+        package.header.typeUuid[4], package.header.typeUuid[5],
+        package.header.typeUuid[6], package.header.typeUuid[7],
+        package.header.typeUuid[8], package.header.typeUuid[9],
+        package.header.typeUuid[10], package.header.typeUuid[11],
+        package.header.typeUuid[12], package.header.typeUuid[13],
+        package.header.typeUuid[14], package.header.typeUuid[15]);
+    Printf("  Type UUID:   %s\n", typeUuidStr);
+    Printf("  Install Options: 0x%X\n", package.header.installOptions);
+    Printf("  Install Phase:   0x%X\n", package.header.installPhase);
+    Printf("  Package Options: 0x%X\n", package.header.packageOptions);
+    Printf("  Files: %d\n", package.header.common.itemCount);
+
+    for (fi = 0; fi < package.header.common.itemCount; fi++) {
+        Printf("    [%d] %-24s offset=0x%LX size=%-10Ld crc=0x%08X\n",
+            fi,
+            package.fileEntry[fi].fileName,
+            package.fileEntry[fi].fileOffset,
+            package.fileEntry[fi].fileSize,
+            package.fileEntry[fi].crc32);
+    }
+    Printf("\n");
+}
+
+// 4. HP CSS Signature Block (at end of file)
+//    Markers: --=</Begin HP Signed File Fingerprint\>=--
+//             --=</End HP Signed File Fingerprint\>=--
+//    Contains: Key name, hash algorithm, base64 RSA signature
+local int64 totalFileSize = FileSize();
+local int64 searchStart = totalFileSize - 2000;
+if (searchStart < 0) searchStart = 0;
+
+local int64 sigOffset = -1;
+local int64 pos;
+local string testStr;
+
+for (pos = searchStart; pos < totalFileSize - 20; pos++) {
+    FSeek(pos);
+    testStr = ReadString(pos, 20);
+    if (Strstr(testStr, "Begin HP Signed") >= 0 ||
+        Strstr(testStr, "Begin HP") >= 0) {
+        // Walk back to find the line start (the --=</ prefix)
+        local int64 lineStart = pos;
+        while (lineStart > pos - 10 && lineStart > 0) {
+            FSeek(lineStart - 1);
+            if (ReadByte(lineStart - 1) == '\n' || ReadByte(lineStart - 1) == '\r')
+                break;
+            lineStart--;
+        }
+        sigOffset = lineStart;
+        break;
+    }
+}
+
+if (sigOffset >= 0) {
+    local int sigSize = (int)(totalFileSize - sigOffset);
+    FSeek(sigOffset);
+    SIGNATURE_BLOCK signatureBlock(sigSize) <comment="HP CSS signature block">;
+
+    Printf("=== HP CSS Signature Block ===\n");
+    Printf("  Offset: 0x%LX\n", sigOffset);
+    Printf("  Size:   %d bytes\n", sigSize);
+    Printf("  Known signing keys:\n");
+    Printf("    PRSSDEV-Key-IPG-RD          (flags=2, production)\n");
+    Printf("    TestDEV-Key-IPG-RD          (flags=1, development)\n");
+    Printf("    SIRIUS-LINUX-APPLICATION-HPB (flags=1, Sirius platform)\n");
+    Printf("    LFP-FW-INTEGRATORS-HPB-2022-1 (flags=1, LFP integrators)\n");
+} else {
+    Printf("WARNING: No HP Signed File Fingerprint block found!\n");
+}
+
+Printf("\n=== BDL Parsing Complete ===\n");
+Printf("Total file size: %Ld bytes (0x%LX)\n", totalFileSize, totalFileSize);
