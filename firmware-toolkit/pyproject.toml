@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "firmware-toolkit"
+version = "0.1.0"
+description = "Extensible firmware image unpacking, patching and packing toolkit"
+requires-python = ">=3.10"
+dependencies = [
+    "kaitaistruct>=0.10",
+]
+
+[project.optional-dependencies]
+ecc = ["bchlib>=1.0"]
+exp = ["pycryptodome>=3.15"]
+
+[project.scripts]
+firmware-toolkit = "firmware_toolkit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["firmware_toolkit*"]
+
+[tool.setuptools.package-data]
+"firmware_toolkit" = ["plugins/*/keys.conf"]
