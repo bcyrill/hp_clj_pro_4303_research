@@ -1,0 +1,73 @@
+// Build script for the HP Dune/Selene Bootloader Loader Ghidra Extension
+//
+// Usage:
+//   Build the extension zip:
+//     gradlew buildExtension
+//
+//   Launch Ghidra with the extension on the classpath (no install needed):
+//     gradlew ghidra
+//
+//   Copy the built extension directly into Ghidra's Extensions folder:
+//     gradlew installDev
+//
+//   The built extension zip will be in the dist/ directory.
+//   Install it in Ghidra via File -> Install Extensions.
+
+apply plugin: 'java'
+
+// Resolve Ghidra installation directory
+def ghidraInstallDir
+
+if (System.env.GHIDRA_INSTALL_DIR) {
+    ghidraInstallDir = System.env.GHIDRA_INSTALL_DIR
+} else if (project.hasProperty("GHIDRA_INSTALL_DIR")) {
+    ghidraInstallDir = project.getProperty("GHIDRA_INSTALL_DIR")
+} else {
+    ghidraInstallDir = "C:\\Tools\\ghidra_12.0.4_PUBLIC"
+}
+
+apply from: new File(ghidraInstallDir, "support/buildExtension.gradle").canonicalPath
+
+// Ghidra user-profile Extensions directory.  Extensions placed here are
+// immediately active without needing manual activation in the UI.
+// e.g. C:\Users\<user>\AppData\Roaming\ghidra\ghidra_12.0.4_PUBLIC\Extensions
+def ghidraVersion = new File(ghidraInstallDir).name   // e.g. "ghidra_11.4.1_PUBLIC"
+def appData = System.env.APPDATA ?: new File(System.getProperty("user.home"), ".ghidra").absolutePath
+def userExtDir = new File(appData, "ghidra/${ghidraVersion}/Extensions")
+
+// Copy the built extension into the user-profile Extensions folder.
+// Extensions here are active immediately — no activation step needed,
+// just restart Ghidra to pick up changes.
+// Clean the dist folder before building to avoid stale zips
+task cleanDist(type: Delete) {
+    delete fileTree("dist") { include "*.zip" }
+}
+buildExtension.dependsOn cleanDist
+
+task installDev(type: Copy) {
+    group = "Ghidra"
+    description = "Copy extension into user-profile Extensions for quick iteration"
+
+    dependsOn buildExtension
+    from zipTree({ file("dist").listFiles()?.find { it.name.endsWith(".zip") } })
+    into userExtDir
+}
+
+// Build, install the extension, and launch Ghidra in one step.
+// Uses Ghidra's own launcher script so the full startup sequence works correctly.
+task ghidra(type: Exec) {
+    group = "Ghidra"
+    description = "Build, install extension, and launch Ghidra"
+
+    dependsOn installDev
+
+    def ghidraDir = new File(ghidraInstallDir)
+    def bat = new File(ghidraDir, "ghidraRun.bat")
+    def sh  = new File(ghidraDir, "ghidraRun")
+
+    if (bat.exists()) {
+        commandLine "cmd", "/c", bat.absolutePath
+    } else {
+        commandLine sh.absolutePath
+    }
+}
