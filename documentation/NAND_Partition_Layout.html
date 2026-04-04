@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HP CLJ Pro 4303 — NAND Partition Layout</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --cyan: #39d2c0;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 40px 30px;
+    min-width: 1000px;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin-bottom: 4px;
+    color: var(--text);
+  }
+  .subtitle {
+    font-size: 13px;
+    color: var(--dim);
+    margin-bottom: 32px;
+  }
+
+  /* ── Fan-out sections ── */
+  .section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+  }
+  .section-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* ── LBI vertical layout ── */
+  .lbi-vertical {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .lbi-row {
+    display: flex;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    min-height: 38px;
+  }
+  .lbi-row:last-child { border-bottom: none; }
+  .lbi-row-header {
+    display: flex;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    min-height: 30px;
+    background: rgba(255,255,255,0.03);
+  }
+  .lbi-row-header .lbi-row-abs,
+  .lbi-row-header .lbi-row-offset,
+  .lbi-row-header .lbi-row-name,
+  .lbi-row-header .lbi-row-size,
+  .lbi-row-header .lbi-row-desc {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  .lbi-row-color {
+    width: 6px;
+    align-self: stretch;
+    flex-shrink: 0;
+  }
+  .lbi-row-abs {
+    width: 110px;
+    padding: 8px 10px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--accent);
+    flex-shrink: 0;
+    text-align: right;
+  }
+  .lbi-row-offset {
+    width: 80px;
+    padding: 8px 10px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--dim);
+    flex-shrink: 0;
+    text-align: right;
+  }
+  .lbi-row-name {
+    width: 130px;
+    padding: 8px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    flex-shrink: 0;
+  }
+  .lbi-row-size {
+    width: 90px;
+    padding: 8px 10px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--dim);
+    flex-shrink: 0;
+  }
+  .lbi-row-desc {
+    flex: 1;
+    padding: 8px 10px;
+    font-size: 11px;
+    color: var(--dim);
+    line-height: 1.4;
+  }
+
+  /* ── Mono ── */
+  .mono {
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 11px;
+  }
+
+  .ro-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 600;
+    background: rgba(248, 81, 73, 0.15);
+    color: var(--red);
+    border: 1px solid rgba(248, 81, 73, 0.3);
+    border-radius: 3px;
+    padding: 1px 5px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .rw-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 600;
+    background: rgba(63, 185, 80, 0.15);
+    color: var(--green);
+    border: 1px solid rgba(63, 185, 80, 0.3);
+    border-radius: 3px;
+    padding: 1px 5px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+
+</style>
+</head>
+<body>
+
+<h1>HP Color LaserJet Pro 4303 — NAND Flash Partition Layout</h1>
+<div class="subtitle">TX54 / Dune Selene &nbsp;·&nbsp; 512 MB NAND &nbsp;·&nbsp; 6 MTD Partitions</div>
+
+<!-- ════════════════════════════════════════════════ -->
+<!-- mtd0 — BOOT PARTITION -->
+<!-- ════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-title">
+    mtd0 — Boot <span class="mono" style="color:var(--dim);">(256 KB)</span>
+    <span class="ro-badge">READ-ONLY</span>
+  </div>
+  <div style="font-size:12px;color:var(--dim);margin-bottom:12px;">
+    First-stage bootloader (FSBL). Contains two identical banks for redundancy — if Bank A is corrupted, the hardware can fall back to Bank B.
+  </div>
+  <div class="lbi-vertical">
+    <div class="lbi-row-header">
+      <div class="lbi-row-color"></div>
+      <div class="lbi-row-abs">Address</div>
+      <div class="lbi-row-offset">Offset</div>
+      <div class="lbi-row-name">Name</div>
+      <div class="lbi-row-size">Size</div>
+      <div class="lbi-row-desc">Description</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#2563eb;"></div>
+      <div class="lbi-row-abs">0x00000000</div>
+      <div class="lbi-row-offset">0x00000</div>
+      <div class="lbi-row-name" style="color:#60a5fa;">Bank A</div>
+      <div class="lbi-row-size">128 KB</div>
+      <div class="lbi-row-desc">Primary FSBL copy. Loaded by the SoC boot ROM at power-on. Initializes DRAM and chain-loads the 2nd-stage bootloader from UpdatableLBI.</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#1e40af;"></div>
+      <div class="lbi-row-abs">0x00020000</div>
+      <div class="lbi-row-offset">0x20000</div>
+      <div class="lbi-row-name" style="color:#93bbfd;">Bank B</div>
+      <div class="lbi-row-size">128 KB</div>
+      <div class="lbi-row-desc">Identical copy of Bank A. Hardware fallback — boot ROM loads from here if Bank A fails integrity checks or has bad blocks.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ -->
+<!-- mtd1 — UpdatableLBI -->
+<!-- ════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-title">
+    mtd1 — UpdatableLBI <span class="mono" style="color:var(--dim);">(5 MB)</span>
+    <span class="ro-badge">READ-ONLY</span>
+  </div>
+  <div style="font-size:12px;color:var(--dim);margin-bottom:12px;">
+    Primary Linux Boot Image (4.01 MB). Contains the second-stage bootloader and Linux kernel in HP's proprietary LBI container format.
+    The FSBL chain-loads the 2nd-stage bootloader from here, which then sets up the DTB, decompresses the kernel, and boots Linux.
+  </div>
+
+  <div class="lbi-vertical">
+    <div class="lbi-row-header">
+      <div class="lbi-row-color"></div>
+      <div class="lbi-row-abs">Address</div>
+      <div class="lbi-row-offset">Offset</div>
+      <div class="lbi-row-name">Name</div>
+      <div class="lbi-row-size">Size</div>
+      <div class="lbi-row-desc">Description</div>
+    </div>
+    <div class="lbi-row" style="background:rgba(71,85,105,0.10);">
+      <div class="lbi-row-color" style="background:#475569;"></div>
+      <div class="lbi-row-abs">0x00040000</div>
+      <div class="lbi-row-offset">0x000</div>
+      <div class="lbi-row-name">Base Header</div>
+      <div class="lbi-row-size">20 B</div>
+      <div class="lbi-row-desc">Magic (<span class="mono" style="color:var(--text);">0xBAD2BFED</span>), format version, header size, section count, data start offset</div>
+    </div>
+    <div class="lbi-row" style="background:rgba(71,85,105,0.06);">
+      <div class="lbi-row-color" style="background:#475569;opacity:0.7;"></div>
+      <div class="lbi-row-abs">0x00040014</div>
+      <div class="lbi-row-offset">0x014</div>
+      <div class="lbi-row-name">Section Descriptors</div>
+      <div class="lbi-row-size">5 × 24 B</div>
+      <div class="lbi-row-desc">Per section: role flags, load address, size, image type, entry point. Padded to 0x800.</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#6366f1;"></div>
+      <div class="lbi-row-abs">0x00040800</div>
+      <div class="lbi-row-offset">0x0800</div>
+      <div class="lbi-row-name" style="color:#a5b4fc;">BMP Splash</div>
+      <div class="lbi-row-size">383 KB</div>
+      <div class="lbi-row-desc">Boot splash screen image (480×272, 24-bit BMP)</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#2563eb;"></div>
+      <div class="lbi-row-abs">0x000A0800</div>
+      <div class="lbi-row-offset">0x60800</div>
+      <div class="lbi-row-name" style="color:#60a5fa;">BL2 — 2nd Stage</div>
+      <div class="lbi-row-size">145 KB</div>
+      <div class="lbi-row-desc">Second-stage bootloader. Loaded to <span class="mono" style="color:var(--text);">0x9FF10680</span>, entry at <span class="mono" style="color:var(--text);">0x9FF10F24</span></div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#0891b2;"></div>
+      <div class="lbi-row-abs">0x000C5000</div>
+      <div class="lbi-row-offset">0x85000</div>
+      <div class="lbi-row-name" style="color:#67e8f9;">DTB</div>
+      <div class="lbi-row-size">22 KB</div>
+      <div class="lbi-row-desc">Flattened Device Tree Blob. Loaded to <span class="mono" style="color:var(--text);">0x93F3A000</span>. Root FS on <span class="mono" style="color:var(--text);">ubi.mtd=2</span></div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#059669;"></div>
+      <div class="lbi-row-abs">0x000CA800</div>
+      <div class="lbi-row-offset">0x8A800</div>
+      <div class="lbi-row-name" style="color:#34d399;">Linux Kernel</div>
+      <div class="lbi-row-size">3.47 MB</div>
+      <div class="lbi-row-desc">Compressed zImage. Loaded to <span class="mono" style="color:var(--text);">0x81000000</span></div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#dc2626;"></div>
+      <div class="lbi-row-abs">0x00443000</div>
+      <div class="lbi-row-offset">0x403000</div>
+      <div class="lbi-row-name" style="color:#fca5a5;">Auth / Signature</div>
+      <div class="lbi-row-size">266 B</div>
+      <div class="lbi-row-desc">RSA-2048 signature over SHA-256 hash of all preceding data (streaming verification from byte 0 to 0x403000)</div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ -->
+<!-- mtd2 — RootFS -->
+<!-- ════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-title">
+    mtd2 — RootFS <span class="mono" style="color:var(--dim);">(262 MB)</span>
+    <span class="ro-badge">READ-ONLY</span>
+  </div>
+  <div style="font-size:12px;color:var(--dim);margin-bottom:12px;">
+    Primary root filesystem. Mounted at <span class="mono" style="color:var(--text);">/</span> during normal boot.
+  </div>
+  <div class="lbi-vertical">
+    <div class="lbi-row-header">
+      <div class="lbi-row-color"></div>
+      <div class="lbi-row-abs">Address</div>
+      <div class="lbi-row-offset">Offset</div>
+      <div class="lbi-row-name">Name</div>
+      <div class="lbi-row-size">Size</div>
+      <div class="lbi-row-desc">Description</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#059669;"></div>
+      <div class="lbi-row-abs">0x00540000</div>
+      <div class="lbi-row-offset">0x00000</div>
+      <div class="lbi-row-name" style="color:#3fb950;">UBI Image</div>
+      <div class="lbi-row-size">262 MB</div>
+      <div class="lbi-row-desc">NAND wear-leveling and bad-block management</div>
+    </div>
+    <!-- SquashFS nested below -->
+    <div style="display:flex;border-bottom:none;">
+      <div style="width:6px;background:#059669;flex-shrink:0;"></div>
+      <div style="flex:1;padding:4px 10px 10px 190px;">
+        <div style="border:1px solid #34d399;border-radius:5px;padding:10px;background:rgba(52,211,153,0.04);">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:12px;font-weight:600;color:#6ee7b7;">SquashFS Volume</span>
+            <span style="font-size:10px;color:var(--dim);">— Read-only compressed filesystem</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ -->
+<!-- mtd3 — RWFS -->
+<!-- ════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-title">
+    mtd3 — RWFS <span class="mono" style="color:var(--dim);">(142 MB)</span>
+    <span class="rw-badge">READ-WRITE</span>
+  </div>
+  <div style="font-size:12px;color:var(--dim);margin-bottom:12px;">
+    Read-write filesystem for persistent storage. The only writable partition on the device.
+  </div>
+  <div class="lbi-vertical">
+    <div class="lbi-row-header">
+      <div class="lbi-row-color"></div>
+      <div class="lbi-row-abs">Address</div>
+      <div class="lbi-row-offset">Offset</div>
+      <div class="lbi-row-name">Name</div>
+      <div class="lbi-row-size">Size</div>
+      <div class="lbi-row-desc">Description</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#d97706;"></div>
+      <div class="lbi-row-abs">0x10C00000</div>
+      <div class="lbi-row-offset">0x00000</div>
+      <div class="lbi-row-name" style="color:#d29922;">UBI Image</div>
+      <div class="lbi-row-size">142 MB</div>
+      <div class="lbi-row-desc">NAND wear-leveling and bad-block management</div>
+    </div>
+    <!-- UBIFS nested below -->
+    <div style="display:flex;border-bottom:none;">
+      <div style="width:6px;background:#d97706;flex-shrink:0;"></div>
+      <div style="flex:1;padding:4px 10px 10px 190px;">
+        <div style="border:1px solid #b45309;border-radius:5px;padding:10px;background:rgba(180,83,9,0.06);">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+            <span style="font-size:12px;font-weight:600;color:#fbbf24;">UBIFS Volume</span>
+            <span style="font-size:10px;color:var(--dim);">— Writable, wear-leveled filesystem native to UBI</span>
+          </div>
+          <!-- encrwfs.ext4 nested -->
+          <div style="border:1px dashed #92400e;border-radius:4px;padding:10px;background:rgba(146,64,14,0.06);">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="font-size:12px;font-weight:600;color:#fcd34d;">encrwfs.ext4</span>
+              <span style="font-size:10px;color:var(--dim);">— LUKS2-encrypted ext4 filesystem. Unlocked at boot via a TrustZone-derived key.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ -->
+<!-- mtd4 — RecoveryRootFS -->
+<!-- ════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-title">
+    mtd4 — RecoveryRootFS <span class="mono" style="color:var(--dim);">(97 MB)</span>
+    <span class="ro-badge">READ-ONLY</span>
+  </div>
+  <div style="font-size:12px;color:var(--dim);margin-bottom:12px;">
+    Recovery root filesystem. Same structure as RootFS. Used with RecoveryLBI when the primary system cannot boot.
+  </div>
+  <div class="lbi-vertical">
+    <div class="lbi-row-header">
+      <div class="lbi-row-color"></div>
+      <div class="lbi-row-abs">Address</div>
+      <div class="lbi-row-offset">Offset</div>
+      <div class="lbi-row-name">Name</div>
+      <div class="lbi-row-size">Size</div>
+      <div class="lbi-row-desc">Description</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#0891b2;"></div>
+      <div class="lbi-row-abs">0x19A60000</div>
+      <div class="lbi-row-offset">0x00000</div>
+      <div class="lbi-row-name" style="color:#39d2c0;">UBI Image</div>
+      <div class="lbi-row-size">97 MB</div>
+      <div class="lbi-row-desc">NAND wear-leveling and bad-block management</div>
+    </div>
+    <!-- SquashFS nested below -->
+    <div style="display:flex;border-bottom:none;">
+      <div style="width:6px;background:#0891b2;flex-shrink:0;"></div>
+      <div style="flex:1;padding:4px 10px 10px 190px;">
+        <div style="border:1px solid #67e8f9;border-radius:5px;padding:10px;background:rgba(103,232,249,0.04);">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:12px;font-weight:600;color:#6ee7b7;">SquashFS Volume</span>
+            <span style="font-size:10px;color:var(--dim);">— Read-only compressed filesystem (recovery image)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════ -->
+<!-- mtd5 — RecoveryLBI -->
+<!-- ════════════════════════════════════════════════ -->
+<div class="section">
+  <div class="section-title">
+    mtd5 — RecoveryLBI <span class="mono" style="color:var(--dim);">(4.6 MB)</span>
+    <span class="ro-badge">READ-ONLY</span>
+  </div>
+  <div style="font-size:12px;color:var(--dim);margin-bottom:12px;">
+    Recovery Linux Boot Image (4.01 MB). Same LBI container format as UpdatableLBI. BMP, kernel, and headers are identical; the DTB points to mtd4 (RecoveryRootFS) instead of mtd2, and the BL2 has a different embedded hash. The Auth signature covers the differing content.
+  </div>
+
+  <div class="lbi-vertical">
+    <div class="lbi-row-header">
+      <div class="lbi-row-color"></div>
+      <div class="lbi-row-abs">Address</div>
+      <div class="lbi-row-offset">Offset</div>
+      <div class="lbi-row-name">Name</div>
+      <div class="lbi-row-size">Size</div>
+      <div class="lbi-row-desc">Description</div>
+    </div>
+    <div class="lbi-row" style="background:rgba(71,85,105,0.10);">
+      <div class="lbi-row-color" style="background:#475569;"></div>
+      <div class="lbi-row-abs">0x1FB60000</div>
+      <div class="lbi-row-offset">0x000</div>
+      <div class="lbi-row-name">Base Header</div>
+      <div class="lbi-row-size">20 B</div>
+      <div class="lbi-row-desc">Magic (<span class="mono" style="color:var(--text);">0xBAD2BFED</span>), format version, header size, section count, data start offset</div>
+    </div>
+    <div class="lbi-row" style="background:rgba(71,85,105,0.06);">
+      <div class="lbi-row-color" style="background:#475569;opacity:0.7;"></div>
+      <div class="lbi-row-abs">0x1FB60014</div>
+      <div class="lbi-row-offset">0x014</div>
+      <div class="lbi-row-name">Section Descriptors</div>
+      <div class="lbi-row-size">5 × 24 B</div>
+      <div class="lbi-row-desc">Per section: role flags, load address, size, image type, entry point. Padded to 0x800.</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#6366f1;"></div>
+      <div class="lbi-row-abs">0x1FB60800</div>
+      <div class="lbi-row-offset">0x0800</div>
+      <div class="lbi-row-name" style="color:#a5b4fc;">BMP Splash</div>
+      <div class="lbi-row-size">383 KB</div>
+      <div class="lbi-row-desc">Boot splash screen image (480×272, 24-bit BMP)</div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#2563eb;"></div>
+      <div class="lbi-row-abs">0x1FBC0800</div>
+      <div class="lbi-row-offset">0x60800</div>
+      <div class="lbi-row-name" style="color:#60a5fa;">BL2 — 2nd Stage</div>
+      <div class="lbi-row-size">145 KB</div>
+      <div class="lbi-row-desc">Second-stage bootloader. Loaded to <span class="mono" style="color:var(--text);">0x9FF10680</span>, entry at <span class="mono" style="color:var(--text);">0x9FF10F24</span></div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#0891b2;"></div>
+      <div class="lbi-row-abs">0x1FBE5000</div>
+      <div class="lbi-row-offset">0x85000</div>
+      <div class="lbi-row-name" style="color:#67e8f9;">DTB</div>
+      <div class="lbi-row-size">22 KB</div>
+      <div class="lbi-row-desc">Flattened Device Tree Blob. Loaded to <span class="mono" style="color:var(--text);">0x93F3A000</span>. Root FS on <span class="mono" style="color:var(--text);">ubi.mtd=4</span></div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#059669;"></div>
+      <div class="lbi-row-abs">0x1FBEA800</div>
+      <div class="lbi-row-offset">0x8A800</div>
+      <div class="lbi-row-name" style="color:#34d399;">Linux Kernel</div>
+      <div class="lbi-row-size">3.47 MB</div>
+      <div class="lbi-row-desc">Compressed zImage. Loaded to <span class="mono" style="color:var(--text);">0x81000000</span></div>
+    </div>
+    <div class="lbi-row">
+      <div class="lbi-row-color" style="background:#dc2626;"></div>
+      <div class="lbi-row-abs">0x1FF63000</div>
+      <div class="lbi-row-offset">0x403000</div>
+      <div class="lbi-row-name" style="color:#fca5a5;">Auth / Signature</div>
+      <div class="lbi-row-size">266 B</div>
+      <div class="lbi-row-desc">RSA-2048 signature over SHA-256 hash of all preceding data (streaming verification from byte 0 to 0x403000)</div>
+    </div>
+  </div>
+</div>
+
+<div style="text-align:center;font-size:11px;color:var(--dim);margin-top:12px;">
+  HP Color LaserJet Pro 4301-4303 &nbsp;·&nbsp; TX54 / Dune Selene &nbsp;·&nbsp; NAND Partition Analysis &nbsp;·&nbsp; 2026-03-15
+</div>
+
+</body>
+</html>
