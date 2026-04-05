@@ -85,13 +85,22 @@ Run auto-analysis.  Because the binary is stripped (no symbol table), Ghidra wil
 
 ### Step 2.3 — Locate the SHA-256 implementation
 
-Search the BL2 for the SHA-256 constants.  SHA-256 initialises its state with eight specific 32-bit words.  Search for the first: `0x6A09E667`.
+Search the BL2 **data** for the SHA-256 initial hash values H0 and H1.  Because the BL2 is BE8, multi-byte data values are stored **big-endian**.  Search for the 8-byte sequence:
 
-Alternatively, search for the round constants.  The first four 32-bit words of the SHA-256 K table are `0x428A2F98`, `0x71374491`, `0xB5C0BF6F`, `0xE9B5DBa5`.
+```
+6A 09 E6 67 BB 67 AE 85
+```
 
-Once you find the data, follow cross-references backward to identify:
+This is H0 (`0x6A09E667`) followed by H1 (`0xBB67AE85`).  The remaining six words (H2–H7) will follow immediately.
 
-- **SHA256_Init** — writes the eight initial hash values into a context buffer.
+Alternatively, search for the first four round constants (K table): `0x428A2F98`, `0x71374491`, `0xB5C0BF6F`, `0xE9B5DBA5` — each stored big-endian.
+
+Once you find the H0 data, identify the code that references it.  In the Thumb2 disassembly, look for a `MOVW` / `MOVT` pair that loads the address of this data (accounting for the TrustZone +0x40000000 VA mapping).  This MOVW/MOVT pair is inside **SHA256_Init**.
+
+> **Important:** SHA256_Init is typically a **leaf function** (it does not call other functions).  Its prologue may be just `PUSH {r5}` — without LR — so scanning backward for `PUSH {…, LR}` to find the function start **will miss it**.  Instead, determine the entry point by checking which address other functions branch to:  scan the BL2 for Thumb2 `BL` (Branch with Link) instructions, and find the most common BL target in the few bytes *before* the H0 MOVW instruction.  That target address is SHA256_Init's entry point.
+
+From SHA256_Init, identify the related functions by looking at its callers' code:
+
 - **SHA256_Update** — feeds data into the hash.  Takes three arguments: `(ctx, data_ptr, length)`.
 - **SHA256_Final** — finalises the hash and writes the 32-byte digest.
 
@@ -99,7 +108,9 @@ Label these functions in Ghidra.
 
 ### Step 2.4 — Find Security_ComputeDeviceHash
 
-Look at the cross-references (XREFs) to `SHA256_Update`.  You are looking for a function that calls `SHA256_Update` exactly **three times in sequence**, bracketed by `SHA256_Init` and `SHA256_Final`.  The call pattern is:
+Look at the callers of SHA256_Init.  For each caller, determine the function boundaries (scan forward from the `PUSH {…, LR}` prologue to the *next* `PUSH {…, LR}` to avoid premature termination at conditional early-return `POP {PC}` instructions).  Within each caller's function body, count how many times each BL target is called (excluding SHA256_Init itself).  You are looking for the caller that has another target called exactly **three times** — that target is SHA256_Update, and the caller is Security_ComputeDeviceHash.
+
+The call pattern is:
 
 ```
 SHA256_Init(ctx)
@@ -116,7 +127,7 @@ In the Thumb2 disassembly, the function loads two 32-bit data addresses using `M
 
 ### Step 2.5 — Read the key strings
 
-Convert the virtual addresses to binary file offsets:
+Within Security_ComputeDeviceHash, find all `MOVW` / `MOVT` instruction pairs.  Resolve each to a binary offset:
 
 ```
 file_offset = (runtime_VA - 0x40000000) - load_address
@@ -124,11 +135,15 @@ file_offset = (runtime_VA - 0x40000000) - load_address
 
 If the addresses are already in the `0x9FFx_xxxx` range (depending on how Ghidra loaded the file), subtract only `load_address`.
 
-Navigate to those offsets in the BL2 binary.
+Read the null-terminated ASCII string at each resolved offset.  You should find exactly two printable strings (other MOVW/MOVT pairs will point to code addresses, non-string data, or stack-relative values — discard those).
 
-**First string (ptr_A)** — the `platform_prefix`.  This is a null-terminated ASCII string whose length is computed at runtime by `Strlen`.  Read bytes until the first `0x00`.
+**Distinguishing the two strings:**  Scan backward from each of the three SHA256_Update `BL` call sites for a `MOVS R2, #imm8` instruction (which sets the length argument).  You will find:
 
-**Second string (ptr_B)** — the `platform_uuid`.  This is exactly 0x24 (36) bytes.  The function copies it onto the stack before hashing.  The source address can be identified from the `MOVW`/`MOVT` pair that appears earlier in the function (before the SHA-256 calls — the data is copied to a stack buffer in the function prologue).
+- One call preceded by `MOVS R2, #0x20` — the 32-byte digest (runtime data, not a key).
+- One call preceded by `MOVS R2, #0x24` — the string passed with fixed length 36 is the **platform_uuid**.
+- One call with no fixed-immediate length (its length comes from Strlen's return value) — that string is the **platform_prefix**.
+
+Alternatively, the string whose length equals the non-0x20 immediate (0x24 = 36) is the `platform_uuid`; the other is the `platform_prefix`.
 
 Record both values.  These are the `platform_prefix` and `platform_uuid` fields for the BDL plugin's `keys.conf`.
 
