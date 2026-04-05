@@ -147,6 +147,8 @@ Alternatively, the string whose length equals the non-0x20 immediate (0x24 = 36)
 
 Record both values.  These are the `platform_prefix` and `platform_uuid` fields for the BDL plugin's `keys.conf`.
 
+> **Automated alternative:** The `FindBdlKeys.java` Ghidra script automates this entire procedure (Steps 2.3–2.5).  Run it in Ghidra after loading the BL2 binary as ARM:LEBE:32:v7LEInstruction with auto-analysis.  The script does not rely on function names — it locates SHA256_Init via the H0 constants, then identifies Security_ComputeDeviceHash by its 3× SHA256_Update call pattern, and reads the key strings directly from memory.
+
 ### Step 2.6 — Verification
 
 The BDL key derivation formula is:
