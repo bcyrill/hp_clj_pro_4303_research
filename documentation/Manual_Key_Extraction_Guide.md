@@ -189,7 +189,9 @@ The binary is stripped, but because it is a proper ELF with section headers, Ghi
 
 ### Step 3.3 — Find the outer-layer key derivation (firmware_salt)
 
-The export encryption uses MD5-based key derivation.  Search for references to the `dune::framework::core::md5::MD5` class or its `update` / `finalize` / `raw_digest` methods.
+The export encryption uses MD5-based key derivation.  The most reliable entry point is the `raw_digest` method of the `dune::framework::core::md5::MD5` class.  Find all code-section functions named `raw_digest` (skip EXTERNAL-block stubs), then find their callers — the callers with size > 100 bytes are the key derivation functions.
+
+> **Automated alternative:** The `FindExpKeys.java` Ghidra script automates this entire procedure (Parts 3.3 and 3.4).  Run it in Ghidra after loading `lib01f1dd40.so` with auto-analysis.
 
 You are looking for a function that performs:
 
@@ -223,12 +225,16 @@ The `DATA_ADDR` is loaded via a GOT-relative reference.  Follow it to find the 1
 
 ### Step 3.4 — Find the outer IV
 
-From the same key derivation function (or its caller), trace the code path to the actual AES encryption.  The encryption function will:
+Alternatively, find all code-section functions named `EVP_EncryptInit` (not EXTERNAL stubs).  Find their callers with body size ≥ 100 bytes — these are the encryption functions.  Among each encryption function's callees, look for the sequential IV fill described below.
 
-1. Call a vtable method to determine the cipher type and IV size.
-2. Allocate a buffer of IV-size bytes.
-3. Call a function to **fill the IV buffer**.
-4. Call `EVP_DecryptInit(ctx, cipher, key, iv_buffer)` (or `EVP_EncryptInit`).
+The encryption function:
+
+1. Calls a vtable method to determine the cipher type and IV size (resolves to AES-256-CBC).
+2. Allocates a buffer of IV-size bytes.
+3. Calls a function to **fill the IV buffer** (sequential fill for outer layer, or base64 decode for per-file inner layer).
+4. Calls `EVP_EncryptInit(ctx, cipher, key, iv_buffer)`.
+
+> **Note:** The export path uses `EVP_EncryptInit` (not `EVP_DecryptInit`).  The corresponding decrypt path exists separately.  Either can be used as an entry point, but `EVP_EncryptInit` is more direct for the export feature.
 
 The IV-filling function is a short subroutine that receives the buffer pointer and the desired size.  When decompiled, it reduces to:
 
@@ -256,7 +262,7 @@ outer_iv = [START_VALUE, START_VALUE+1, START_VALUE+2, ..., START_VALUE+15]
 
 Record the IV as a comma-separated list of decimal byte values.
 
-To find this function without knowing its address: in the encryption function, look at the call immediately before the `EVP_DecryptInit` / `EVP_EncryptInit` invocation.  Two sub-functions are called depending on a boolean parameter: one fills the IV sequentially (for the outer layer), and the other decodes a base64-encoded IV (for per-file inner encryption).  You want the sequential one — it is the simpler of the two and does not reference `BIO_f_base64`.
+To find this function without knowing its address: in the encryption function, look at the callees.  Two sub-functions handle IV generation depending on the operation type: one fills the IV sequentially (for the outer layer), and the other decodes a base64-encoded IV (for per-file inner encryption).  You want the sequential one — it is the simpler of the two and does not reference `BIO_f_base64`.
 
 ### Step 3.5 — Find the default family string
 
