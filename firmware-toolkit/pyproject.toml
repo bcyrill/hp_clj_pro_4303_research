@@ -22,4 +22,7 @@ firmware-toolkit = "firmware_toolkit.cli:main"
 include = ["firmware_toolkit*"]
 
 [tool.setuptools.package-data]
-"firmware_toolkit" = ["plugins/*/keys.conf"]
+"firmware_toolkit" = [
+    "plugins/*/keys.conf",
+    "plugins/*/data/*.json",
+]

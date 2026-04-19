@@ -10,14 +10,96 @@
 // dune_selene_kexec_trusted_fw.bin (bootloaders),
 // and kernel_6.17.elf (Linux kernel NVM driver).
 //
-// Three-tier architecture:
+// Three-tier system architecture (system-wide view):
 //   Tier 1: Bootloader partitioned fields (0x000-0x0C1)
-//   Tier 2: Bootloader flat fields (0x100-0x131)
-//   Tier 3: Kernel NVM object storage (0x2C0+)
+//   Tier 2: Bootloader flat fields          (0x100-0x130)
+//   Tier 3: Kernel NVM object storage       (0x2C0+)
+//
+// The NOS region (0x000-0x1FD) has its own internal
+// three-tier partitioning in the firmware_toolkit codec
+// (not to be confused with the system view above):
+//   NOS Tier-1: partitioned fields          (0x000-0x0C1)
+//   NOS Tier-2: bootloader flat fields      (0x100-0x130)
+//   NOS Tier-3: NOS NVM extension           (0x131-0x1FD)
+//                - backup_device_pin  @0x131 (4 B, NVM ID 0x94)
+//                - nos_nvm_reserved   @0x135 (201 B, 0xFF filler)
 //
 // Bootloader field layout from type 0x40 sub-partition
 // table at binary address 0x9FF33AA4 (21 entries).
 // Kernel NVM layout from _nvm_build_table decompilation.
+//
+// ---------------------------------------------------------
+// Write-path / backup / torn-write model (firmware 6.28.1.47)
+// ---------------------------------------------------------
+// See documentation_current/NVM2_Write_Path.md for details.
+// Summary:
+//
+//   Userspace → kernel framing on write(/dev/eeprom, …):
+//     0x46 'F'  set/upsert : [0x46 | var_id:LE2 | vendor_id:LE2 | ciphertext:1..512]
+//     0x44 'D'  delete     : [0x44 | var_id:LE2 | vendor_id:LE2 | 0x44]  (6 bytes)
+//     0x52 'R'  recovery/raw (kernel-internal)
+//   Ciphertext is produced by NVRamEEPROM::encodeData() in libNvram.so
+//   BEFORE the write() — the kernel stores only ciphertext for v=2.
+//
+//   Kernel allocator (kernel.elf _nvm_allocate / _delete_object):
+//     - Packed, not append-only: first-fit into pages starting at page 11.
+//     - Multi-page spans: alloc_bits[p..p+k]=1, span_bits[p+1..p+k]=1.
+//     - Delete compacts via memmove() and clears bitmap bits on empty pages.
+//     - Unused tail of an allocated page is 0xFF fill; no in-storage
+//       end-of-record sentinel tag.
+//
+//   Per-record integrity:
+//     - Journal bit lives inside the stored object_id and is set during
+//       a destructive change, cleared on commit. _nvm_build_table drops
+//       journalled copies on boot if a non-journalled duplicate exists.
+//     - NO per-record CRC / MAC anywhere in the NVM2 region. CRC32 in
+//       libNvram.so is only a name→id hash; SHA-256 is only in the
+//       backup-file layer (HP_Dune_Selene_Backup_Encryption.md).
+//
+//   Image backup (RedundancyNvramEEPROM, libNvram.so 0x31860 doValidateOperate):
+//     Primary  : /mnt/rw/backups/eeprom.bak        (text metadata header +
+//                                                   AES-wrapped 32 KB image;
+//                                                   envelope per
+//                                                   HP_Dune_Selene_Backup_Encryption.md)
+//     Staging  : /mnt/rw/backups/eeprom.bak.part   (atomic rename target)
+//     Directory: /mnt/rw/backups/                  (auto-created by setupBackup)
+//
+//   Reconciliation state machine (runs ONCE per boot, at framework NVRAM-
+//   stack init; NOT per write, NOT on a timer):
+//     1. setupBackup()                -> ensure dir exists
+//     2. validateResetMetaData()      -> remove() stale backup if Reset-Mark
+//                                        is not 3 or 5
+//     3. validateOperationMetaData(recoveryCount) returns:
+//           1  if  recoveryCount == 0                      (fresh boot)
+//                  OR backup missing / unparseable
+//                  OR stored Recovery-Count == recoveryCount
+//                   -> doUploadData  (live EEPROM -> backup, refresh)
+//           2  if  stored Recovery-Count != recoveryCount
+//                   -> doDownloadData (backup -> live EEPROM, restore)
+//           3  (rare/external path)
+//                   -> doResetData    (ioctl 0x800465c9, _format_nvm)
+//
+//   Precedence: the recovery-count (== NVM2 format_count @ 0x211) is the
+//   sole arbiter. Equal  -> trust live, refresh backup. Unequal  -> trust
+//   backup, restore it. NO byte-by-byte compare.
+//
+//   Bulk-image ioctls bracketed with key install/release:
+//     0x8004656f  install 32-B key (from kernel keyring, secretKeyDiscovery)
+//     0x8004656c  bulk read  0x8000 B  (upload : live -> userspace buffer)
+//     0x8004656e  bulk write 0x8000 B  (download: buffer -> live, SHA-256 checked)
+//     0x80046570  release key
+//     0x800465c9  format NVM (reset path)
+//
+//   CONSEQUENCE FOR OUT-OF-BAND FLASHING:
+//   When reflashing the EEPROM image, ALSO delete /mnt/rw/backups/eeprom.bak.
+//   Otherwise on the next boot, if the stored backup's Recovery-Count does
+//   not match the flashed image's format_count, doDownloadData will silently
+//   restore the stale pre-flash image on top of the fresh one.
+//
+// For a byte-identical round-trip encoder:
+//   preserve record page/offsets, bitmaps and format_count verbatim;
+//   re-XOR the Layer-1 keystream onto the plaintext; pad 0xFF; never
+//   set the journal bit; erase /mnt/rw/backups/eeprom.bak when reflashing.
 //------------------------------------------------
 
 LittleEndian();
@@ -39,6 +121,7 @@ local int cNVMObject   = 0xFFA500;  // orange
 local int cMAC         = 0x90EE90;  // light green
 local int cPadding     = 0xD3D3D3;  // light gray
 local int cDynGap      = 0xE8E8E8;  // lighter gray
+local int cNosNvmExt   = 0xBFEFFF;  // pale cyan (NOS NVM extension tier-3)
 local int cRootPtr     = 0xDDA0DD;  // plum (matches NVM2 header)
 
 //------------------------------------------------
@@ -50,6 +133,62 @@ typedef enum <ubyte> {
     PROT_MIRROR_ONLY         = 2,  // primary + mirror(XOR 0xFF) (2N)
     PROT_MIRROR_CHECKSUM_ALT = 3,  // same as 0, different checksum seed (2N+1)
 } PROT_TYPE;
+
+//------------------------------------------------
+// NVM2 Vendor IDs (TLV tag byte, top 8 bits of the
+// 24-bit object ID).
+//
+// The tag indexes into libNvram.so's dispatch table
+// at ELF offset 0x68b2c (Ghidra 0x78b2c) — 6 entries
+// of {Uuid* GUIDE_ptr, uint32 tag}. Each GUIDE points
+// to a 16-byte Uuid global defined in libframework.so
+// and runtime-initialised by its _INIT_24 constructor
+// (@Ghidra 0x12da00) via Uuid::fromChars(guide, uuid_str).
+//
+// The Layer-1 XOR key derivation for v=2 and for
+// non-v2 tags is identical:
+//   k_name = SHA256(vendor_uuid_36char_str || varname)
+//   key_stripe[i] = k_name[i%32] XOR DUID[i%32]
+// Only the UUID input string differs per-tag.
+//
+// Confirmed mappings (firmware 6.28.1.47):
+//   tag 0x01 -> HP_DUNE_NUMERIC_GUIDE
+//              "4e565241-4d5f-5355-4944-5f5641525300"
+//              (ASCII: "NVRAM_SUID_VARS\x00")
+//   tag 0x02 -> HP_DUNE_SETTINGS_GUIDE
+//              "48505f44-554e-455f-5345-5454494e4753"
+//              (ASCII: "HP_DUNE_SETTINGS")
+//   tag 0x03 -> BIOS_SETTINGS_GUIDE
+//              "845e3285-c67c-4f4b-9aa4-0ae91bd35089"
+//   tag 0x04 -> DEVICE_CONFIG_GUIDE
+//              "0429e79e-d9ba-412e-a2bc-1f3d245041ce"
+//   tag 0x05 -> DEVICE_INFO_GUIDE
+//              "1429e79e-d9ba-412e-a2bc-1f3d245041ce"
+//   tag 0x0a -> NVRAM_LOCAL_TEST_GUIDE
+//              "4e565241-4d5f-4c4f-4341-4c5f54455354"
+//              (ASCII: "NVRAM_LOCAL_TEST")
+//
+// Tags not in the libframework GUIDE dispatch
+// (handled by separate code paths / legacy writers):
+//   tag 0x06 -> MAC/power-cycle namespace (WLAN0/WLAN1
+//              MAC, POWER_CYCLE_COUNT) — not routed
+//              through the v=2 crypto, flat fields
+//   tag 0x14 -> bootloader BOOT_FLAGS alt namespace
+//
+// Vendor 2 (HP_DUNE_SETTINGS) dominates the dump and
+// holds all crypto-sensitive Region-B variables
+// (DefaultDevicePin, BackupDevicePin, counters, etc.).
+//------------------------------------------------
+typedef enum <ubyte> {
+    NVM_VENDOR_HP_DUNE_NUMERIC  = 0x01,  // HP_DUNE_NUMERIC_GUIDE / NVRAM_SUID_VARS (small numeric IDs, e.g. DefaultDevicePin-alt 0x01 format)
+    NVM_VENDOR_HP_DUNE_SETTINGS = 0x02,  // HP_DUNE_SETTINGS_GUIDE (Layer-1 XOR encrypted, majority of dump)
+    NVM_VENDOR_BIOS_SETTINGS    = 0x03,  // BIOS_SETTINGS_GUIDE (CfgRuntimeProduct/CfgDerivative-class)
+    NVM_VENDOR_DEVICE_CONFIG    = 0x04,  // DEVICE_CONFIG_GUIDE (MAP_REVISION/PSKU-class)
+    NVM_VENDOR_DEVICE_INFO      = 0x05,  // DEVICE_INFO_GUIDE (device identity)
+    NVM_VENDOR_WLAN_MAC         = 0x06,  // WLAN0/WLAN1 MAC, POWER_CYCLE_COUNT (NOT a libframework GUIDE)
+    NVM_VENDOR_NVRAM_LOCAL_TEST = 0x0a,  // NVRAM_LOCAL_TEST_GUIDE (ETH0 MAC piggybacks here in some builds)
+    NVM_VENDOR_BOOT_FLAGS_ALT   = 0x14,  // BOOT_FLAGS alt namespace (NOT a libframework GUIDE)
+} NVM_VENDOR_ID;
 
 //------------------------------------------------
 // SECTION 1: NVM Partitioned Field Region (0x000–0x0C1)
@@ -249,9 +388,10 @@ typedef struct {
 } NVM_PARTITIONED_FIELDS <comment="NVM partitioned field region (0x000-0x0FF, type 0x40 layout)">;
 
 //------------------------------------------------
-// SECTION 2: Flat NVM Fields (0x100–0x131)
+// SECTION 2: Flat NVM Fields (0x100–0x130)
 // 13 fields, contiguous, accessed via flat table
-// (partition_id > 0x80)
+// (partition_id > 0x80). 49 bytes total; the byte
+// at 0x131 belongs to Section 3 (NOS NVM extension).
 //------------------------------------------------
 
 typedef struct {
@@ -317,21 +457,52 @@ typedef struct {
 
     // 0x12F: UNKNOWN_1C (field_id=0x1C, pid=0x93, sz=2, prot=1)
     ushort  unknown_1c <format=hex, comment="Unknown field 0x1C", bgcolor=cFlatField>;
-} FLAT_NVM_FIELDS <comment="Flat NVM fields (0x100-0x131)">;
+} FLAT_NVM_FIELDS <comment="Flat NVM fields (0x100-0x130, 13 entries, 49 bytes)">;
 
 //------------------------------------------------
-// Gap between flat fields end (0x131) and root
-// page pointer (0x1FE)
+// SECTION 3: NOS NVM Extension (0x131–0x1FD)
+//
+// Bytes that are part of the NOS region but NOT in
+// the bootloader's flat table. Accessed by the
+// userspace NOS NVM system (libNvram.so) using its
+// own NOS NVM IDs — the bootloader neither reads
+// nor writes them.
+//
+// 0x131-0x134: BackupDevicePin (NOS NVM ID 0x94,
+//   4 bytes). Firmware treats this as a little-
+//   endian integer in RAM; the firmware-toolkit
+//   sidecar stores it as a hex string in on-disk
+//   byte order (so "0xFFFFFFFF" when unprogrammed).
+//   See HP_Dune_Selene_PIN_Analysis.md §8.3.
+// 0x135:        Flat-cache tail byte (end of the
+//   bootloader's 0x000-0x135 cached span).
+// 0x136-0x1FD:  0xFF-filled unused filler between
+//   the NOS region and the NVM2 root-page pointer.
+//
+// The last two ranges (0x135-0x1FD, 201 bytes) are
+// modelled as a single opaque "nos_nvm_reserved"
+// field in the firmware-toolkit sidecar — preserved
+// verbatim so any device-specific state round-trips.
 //------------------------------------------------
 
 typedef struct {
-    ubyte data[0x1FE - 0x131] <format=hex>;
-} FLAT_TO_NVM2_GAP <comment="Gap: flat cache tail + unused (0x131-0x1FD)">;
+    ubyte   backup_device_pin[4] <format=hex,
+        comment="BackupDevicePin (NOS NVM ID 0x94, 4 B on-disk-LE). Sidecar representation: hex string \"0xAABBCCDD\" in on-disk byte order — byte-reverse to recover the logical LE integer.",
+        bgcolor=cNosNvmExt>;
+    ubyte   nos_nvm_reserved[201] <format=hex,
+        comment="Opaque filler: flat-cache tail byte @ 0x135 + 0xFF-filled gap 0x136-0x1FD. Preserved verbatim.",
+        bgcolor=cNosNvmExt>;
+} NOS_NVM_EXTENSION <comment="NOS NVM extension (0x131-0x1FD, tier-3 userspace-only NOS fields)">;
 
 //------------------------------------------------
-// SECTION 3: Root Page Pointer (0x1FE–0x1FF)
+// SECTION 4: Root Page Pointer (0x1FE–0x1FF)
 // Big-endian uint16, written by _write_root_page()
 // Points to start of NVM2 metadata (page 8 = 0x200)
+//
+// NOTE: The firmware-toolkit plugin models these 2
+// bytes as part of the NVM2 region (nvm2_region.bin
+// starts at 0x01FE and exposes root_page_pointer in
+// nvm2_layout.json), not as part of the NOS region.
 //------------------------------------------------
 
 typedef struct {
@@ -341,7 +512,7 @@ typedef struct {
 } ROOT_PAGE_PTR <comment="NVM2 root page pointer (0x1FE-0x1FF, big-endian)">;
 
 //------------------------------------------------
-// SECTION 4: NVM2 Header (0x200–0x212)
+// SECTION 5: NVM2 Header (0x200–0x212)
 //
 // Written by _write_root_page() and _format_nvm()
 // in the kernel NVM driver. Total 19 bytes (including
@@ -379,7 +550,12 @@ typedef struct {
     ubyte   debug_level <format=hex, comment="Debug verbosity (0xFF = disabled)">;
 
     // 0x211: Generation / recovery counter (LE uint16)
-    ushort  generation_counter <comment="Generation/recovery counter (sysfs: eeprom_recovery_count)">;
+    //        a.k.a. "format_count" in NVM2_Write_Path.md.
+    //        Bumped only by _format_nvm(); read by detectSelfRecoveryCount()
+    //        and by RedundancyNvramEEPROM::doValidateOperate (the sole
+    //        arbiter between live EEPROM and /mnt/rw/backups/eeprom.bak).
+    //        Mirrored in NOS Tier-1 as EEPROM_RECOV_COUNT at 0x06A-0x06B.
+    ushort  format_count <comment="format_count / generation_counter / eeprom_recovery_count (bumped only by _format_nvm)">;
 
 } NVM2_HEADER <comment="NVM2 header (0x200-0x212, 19 bytes)">;
 
@@ -393,7 +569,7 @@ typedef struct {
 } NVM2_HEADER_PADDING <comment="NVM2 header padding (0x213-0x23F, 0xFF fill)">;
 
 //------------------------------------------------
-// SECTION 5: Page Bitmaps (0x240–0x2BF)
+// SECTION 6: Page Bitmaps (0x240–0x2BF)
 //
 // Two 64-byte bitmaps maintained by the kernel NVM
 // driver. Each bit corresponds to one 64-byte page
@@ -408,7 +584,2741 @@ typedef struct {
 } PAGE_BITMAP;
 
 //------------------------------------------------
-// SECTION 6: NVM Object Header
+// NVM Variable Name Lookup
+//
+// Derived from libNvram.so 0x5fe4c..0x68000 (v=2,
+// 2618 entries) + 48-entry descriptor table at
+// 0x5fa90..0x5fe50 (v!=2 entries).
+//
+// Key = (vendor_id << 16) | name_id  == NVM_OBJECT.obj_id
+//
+// Used by ReadNVMObject() to display human-readable
+// names instead of raw IDs, making known plaintext
+// cribs obvious in the Template Results pane.
+//------------------------------------------------
+
+string LookupNVMName(uint vendor, uint name_id) {
+    // Build a 22-bit composite key: (vendor << 16) | name_id
+    uint key = ((vendor & 0xFF) << 16) | (name_id & 0xFFFF);
+    switch (key) {
+        case 0x010000: return "NVM2_CONTROL";
+        case 0x010005: return "POWER_STATE";
+        case 0x010006: return "BOARD_ID";
+        case 0x010011: return "MFG_ICT_DS_1";
+        case 0x01001e: return "SerialNumber";
+        case 0x010048: return "BOOT_FLAGS2";
+        case 0x01004e: return "CLOCK_OFFSET";
+        case 0x010058: return "BOOT_FLAGS2";
+        case 0x01005e: return "CLOCK_OFFSET";
+        case 0x010120: return "MISC_BITS_1";
+        case 0x01012b: return "MISC_BITS_2";
+        case 0x020001: return "CfgRuntimeProduct";
+        case 0x020002: return "CfgProto";
+        case 0x020003: return "eEngineDataTest1";
+        case 0x020004: return "eCPRNumberOfRetries";
+        case 0x020005: return "eDHalfSensorValuesValid_FullSpeed_Yellow";
+        case 0x020006: return "eDHalfSensorValuesValid_FullSpeed_Magenta";
+        case 0x020007: return "eDHalfSensorValuesValid_FullSpeed_Cyan";
+        case 0x020008: return "eDHalfSensorValuesValid_FullSpeed_Black";
+        case 0x020009: return "eCalibrationEnvironmentStatus";
+        case 0x02000a: return "ePrintDensitySensorValuesYellow";
+        case 0x02000b: return "ePrintDensitySensorValuesMagenta";
+        case 0x02000c: return "ePrintDensitySensorValuesCyan";
+        case 0x02000d: return "ePrintDensitySensorValuesBlack";
+        case 0x02000e: return "eCPRTopMarginOffsetPlane1";
+        case 0x02000f: return "eCPRTopMarginOffsetPlane2";
+        case 0x020010: return "eCPRTopMarginOffsetPlane3";
+        case 0x020011: return "eCPRTopMarginOffsetPlane4";
+        case 0x020012: return "eCPRSideMarginOffsetPlane1";
+        case 0x020013: return "eCPRSideMarginOffsetPlane2";
+        case 0x020014: return "eCPRSideMarginOffsetPlane3";
+        case 0x020015: return "eCPRSideMarginOffsetPlane4";
+        case 0x020016: return "eCPRLineWidthAdjPlane1";
+        case 0x020017: return "eCPRLineWidthAdjPlane2";
+        case 0x020018: return "eCPRLineWidthAdjPlane3";
+        case 0x020019: return "eCPRLineWidthAdjPlane4";
+        case 0x02001a: return "eCPRBowTiltC1";
+        case 0x02001b: return "eCPRBowTiltM1";
+        case 0x02001c: return "eCPRBowTiltY1";
+        case 0x02001d: return "eCPRBowTiltK1";
+        case 0x02001e: return "eCPRBowTiltC2";
+        case 0x02001f: return "eCPRBowTiltM2";
+        case 0x020020: return "eCPRBowTiltY2";
+        case 0x020021: return "eCPRBowTiltK2";
+        case 0x020022: return "eCPRBowTiltC3";
+        case 0x020023: return "eCPRBowTiltM3";
+        case 0x020024: return "eCPRBowTiltY3";
+        case 0x020025: return "eCPRBowTiltK3";
+        case 0x020026: return "CfgProfile";
+        case 0x020027: return "CfgBootMode";
+        case 0x020028: return "CfgBootModeOnce";
+        case 0x020029: return "eFwUpdateMode";
+        case 0x02002a: return "eFwUpdateServerUrl";
+        case 0x02002b: return "eFwUpdateAdminMode";
+        case 0x02002c: return "PowerCycleCount";
+        case 0x02002d: return "PowerDownState";
+        case 0x02002e: return "RtcFailCount";
+        case 0x02002f: return "DefaultDevicePin";
+        case 0x020031: return "CfgDerivative";
+        case 0x020032: return "InstallationDate";
+        case 0x020033: return "ePrint_ColorImpressions";
+        case 0x020034: return "ePrint_MonoImpressions";
+        case 0x020035: return "ObsoleteOOBEState";
+        case 0x020036: return "DeviceUUID";
+        case 0x020037: return "eDCCNVRAMRestoreEnabledSetting";
+        case 0x020038: return "eDCCNVRAMBackupFmtr";
+        case 0x020039: return "eDCCNVRAMBackupEng";
+        case 0x02003a: return "ePrint_A4Equivalent_TotalImpressions";
+        case 0x02003b: return "ePrint_A4Equivalent_ColorImpressions";
+        case 0x02003c: return "ePrint_A4Equivalent_MonoImpressions";
+        case 0x02003d: return "ePrint_A4Equivalent_BlankSides";
+        case 0x02003e: return "ePrint_A4Equivalent_PrintOther_TotalImpressions";
+        case 0x02003f: return "ePrint_A4Equivalent_PrintOther_ColorImpressions";
+        case 0x020040: return "ePrint_A4Equivalent_PrintOther_MonoImpressions";
+        case 0x020041: return "ePrint_A4Equivalent_PrintOther_BlankSides";
+        case 0x020042: return "ePrint_A4Equivalent_Copy_TotalImpressions";
+        case 0x020043: return "ePrint_A4Equivalent_Copy_ColorImpressions";
+        case 0x020044: return "ePrint_A4Equivalent_Copy_MonoImpressions";
+        case 0x020045: return "ePrint_A4Equivalent_Copy_BlankSides";
+        case 0x020046: return "ePrint_A4Equivalent_FaxIn_TotalImpressions";
+        case 0x020047: return "ePrint_A4Equivalent_FaxIn_ColorImpressions";
+        case 0x020048: return "ePrint_A4Equivalent_FaxIn_MonoImpressions";
+        case 0x020049: return "ePrint_A4Equivalent_FaxIn_BlankSides";
+        case 0x02004a: return "eSupplySuppressPFD2";
+        case 0x02004b: return "eDeviceAllowLowState";
+        case 0x02004c: return "eDeviceInDigEcosystem";
+        case 0x02004d: return "eSupplyLowThresholdBlack";
+        case 0x02004e: return "eSupplyLowThresholdCyan";
+        case 0x02004f: return "eSupplyLowThresholdMagenta";
+        case 0x020050: return "eSupplyLowThresholdYellow";
+        case 0x020051: return "eSupplyLowThresholdDrum";
+        case 0x020052: return "eSupplyOutBehaviorBlack";
+        case 0x020053: return "eSupplyOutBehaviorColor";
+        case 0x020054: return "eSupplyOutBehaviorDrum";
+        case 0x020055: return "eSupplyUserSetOutBehavior";
+        case 0x020056: return "eSupplyVLMCSetting";
+        case 0x020057: return "eSupplyHPOnlySetting";
+        case 0x020058: return "eSupplyAntiTheftEnabledSetting";
+        case 0x020059: return "eSupplyAntiTheftModeSetting";
+        case 0x02005a: return "eSupplyVeryLowStateBlack";
+        case 0x02005b: return "eSupplyVeryLowStateCyan";
+        case 0x02005c: return "eSupplyVeryLowStateMagenta";
+        case 0x02005d: return "eSupplyVeryLowStateYellow";
+        case 0x02005e: return "eSupplyVeryLowStateDrum";
+        case 0x02005f: return "eSupplyAntiTheftValueSetting";
+        case 0x020060: return "eSupplyDefaultLowOverrideBlack";
+        case 0x020061: return "eSupplyDefaultLowOverrideCyan";
+        case 0x020062: return "eSupplyDefaultLowOverrideMagenta";
+        case 0x020063: return "eSupplyDefaultLowOverrideYellow";
+        case 0x020064: return "eSupplyDefaultLowOverrideDrum";
+        case 0x020065: return "eSupplyHistoryEntriesK";
+        case 0x020066: return "eSupplyHistoryEntriesC";
+        case 0x020067: return "eSupplyHistoryEntriesM";
+        case 0x020068: return "eSupplyHistoryEntriesY";
+        case 0x020069: return "eSupplyHistoryEntriesD";
+        case 0x02006a: return "eSupplyCrgPixelsRemainingBlack";
+        case 0x02006b: return "eSupplyCrgPixelsRemainingCyan";
+        case 0x02006c: return "eSupplyCrgPixelsRemainingMagenta";
+        case 0x02006d: return "eSupplyCrgPixelsRemainingYellow";
+        case 0x02006e: return "eSupplyCurZone";
+        case 0x02006f: return "eSupplyNVRAMInitComplete";
+        case 0x020070: return "eSupplyPrevZone";
+        case 0x020071: return "eSupplyAuthTransitions";
+        case 0x020072: return "eSupplyCrgMTEngDeveloperLifeK";
+        case 0x020073: return "eSupplyCrgMTEngDeveloperLifeC";
+        case 0x020074: return "eSupplyCrgMTEngDeveloperLifeM";
+        case 0x020075: return "eSupplyCrgMTEngDeveloperLifeY";
+        case 0x020076: return "eSupplyCrgMTEngDeveloperLifeD";
+        case 0x020077: return "eSupplyCrgMTEngDeveloperWearLifeK";
+        case 0x020078: return "eSupplyCrgMTEngDeveloperWearLifeC";
+        case 0x020079: return "eSupplyCrgMTEngDeveloperWearLifeM";
+        case 0x02007a: return "eSupplyCrgMTEngDeveloperWearLifeY";
+        case 0x02007b: return "eSupplyCrgMTEngDeveloperWearLifeD";
+        case 0x02007c: return "eSupplyCrgMTEngDrumLifeK";
+        case 0x02007d: return "eSupplyCrgMTEngDrumLifeC";
+        case 0x02007e: return "eSupplyCrgMTEngDrumLifeM";
+        case 0x02007f: return "eSupplyCrgMTEngDrumLifeY";
+        case 0x020080: return "eSupplyCrgMTEngDrumLifeD";
+        case 0x020081: return "eSupplyCrgMTEngTonerLifeK";
+        case 0x020082: return "eSupplyCrgMTEngTonerLifeC";
+        case 0x020083: return "eSupplyCrgMTEngTonerLifeM";
+        case 0x020084: return "eSupplyCrgMTEngTonerLifeY";
+        case 0x020085: return "eSupplyCrgMTEngTonerLifeD";
+        case 0x020086: return "eSupplyHasSavedDataBlack";
+        case 0x020087: return "eSupplyHasSavedDataCyan";
+        case 0x020088: return "eSupplyHasSavedDataMagenta";
+        case 0x020089: return "eSupplyHasSavedDataYellow";
+        case 0x02008a: return "eSupplyHasSavedDataDrum";
+        case 0x02008b: return "eSupplySuppressPFD";
+        case 0x02008c: return "eSupplyRegionalizationDisabled";
+        case 0x02008d: return "eSupplyStoreData";
+        case 0x02008e: return "eSupplyContractualEverInstalled";
+        case 0x02008f: return "eSupplyRegionalizedCount";
+        case 0x020090: return "eSupplyCrgVLEngDeveloperLifeK";
+        case 0x020091: return "eSupplyCrgVLEngDeveloperLifeC";
+        case 0x020092: return "eSupplyCrgVLEngDeveloperLifeM";
+        case 0x020093: return "eSupplyCrgVLEngDeveloperLifeY";
+        case 0x020094: return "eSupplyCrgVLEngDeveloperLifeD";
+        case 0x020095: return "eSupplyCrgVLEngDeveloperWearLifeK";
+        case 0x020096: return "eSupplyCrgVLEngDeveloperWearLifeC";
+        case 0x020097: return "eSupplyCrgVLEngDeveloperWearLifeM";
+        case 0x020098: return "eSupplyCrgVLEngDeveloperWearLifeY";
+        case 0x020099: return "eSupplyCrgVLEngDeveloperWearLifeD";
+        case 0x02009a: return "eSupplyCrgVLEngDrumLifeK";
+        case 0x02009b: return "eSupplyCrgVLEngDrumLifeC";
+        case 0x02009c: return "eSupplyCrgVLEngDrumLifeM";
+        case 0x02009d: return "eSupplyCrgVLEngDrumLifeY";
+        case 0x02009e: return "eSupplyCrgVLEngDrumLifeD";
+        case 0x02009f: return "eSupplyCrgVLEngTonerLifeK";
+        case 0x0200a0: return "eSupplyCrgVLEngTonerLifeC";
+        case 0x0200a1: return "eSupplyCrgVLEngTonerLifeM";
+        case 0x0200a2: return "eSupplyCrgVLEngTonerLifeY";
+        case 0x0200a3: return "eSupplyCrgVLEngTonerLifeD";
+        case 0x0200a4: return "eSupplyCrgVLFmtrTonerLifeK";
+        case 0x0200a5: return "eSupplyCrgVLFmtrTonerLifeC";
+        case 0x0200a6: return "eSupplyCrgVLFmtrTonerLifeM";
+        case 0x0200a7: return "eSupplyCrgVLFmtrTonerLifeY";
+        case 0x0200a8: return "eSupplyCrgVLFmtrTonerLifeD";
+        case 0x0200a9: return "eSupplyDefaultLowThresholdBlack";
+        case 0x0200aa: return "eSupplyDefaultLowThresholdCyan";
+        case 0x0200ab: return "eSupplyDefaultLowThresholdMagenta";
+        case 0x0200ac: return "eSupplyDefaultLowThresholdYellow";
+        case 0x0200ad: return "eSupplyDefaultLowThresholdDrum";
+        case 0x0200ae: return "eSupplyInstalledTonerLevelBlack";
+        case 0x0200af: return "eSupplyInstalledTonerLevelCyan";
+        case 0x0200b0: return "eSupplyInstalledTonerLevelMagenta";
+        case 0x0200b1: return "eSupplyInstalledTonerLevelYellow";
+        case 0x0200b2: return "eSupplyRawPercentRemainingBlack";
+        case 0x0200b3: return "eSupplyRawPercentRemainingCyan";
+        case 0x0200b4: return "eSupplyRawPercentRemainingMagenta";
+        case 0x0200b5: return "eSupplyRawPercentRemainingYellow";
+        case 0x0200b6: return "eSupplyRawPercentRemainingDrum";
+        case 0x0200b7: return "eSupplyShowLifeTrackingK";
+        case 0x0200b8: return "eSupplyShowLifeTrackingC";
+        case 0x0200b9: return "eSupplyShowLifeTrackingM";
+        case 0x0200ba: return "eSupplyShowLifeTrackingY";
+        case 0x0200bb: return "eSupplyShowLifeTrackingD";
+        case 0x0200bc: return "eSupplySyncPoint1Black";
+        case 0x0200bd: return "eSupplySyncPoint1Cyan";
+        case 0x0200be: return "eSupplySyncPoint1Magenta";
+        case 0x0200bf: return "eSupplySyncPoint1Yellow";
+        case 0x0200c0: return "eSupplySyncPoint1Drum";
+        case 0x0200c1: return "eSupplyWarrantyTriggerPointBlack";
+        case 0x0200c2: return "eSupplyWarrantyTriggerPointCyan";
+        case 0x0200c3: return "eSupplyWarrantyTriggerPointMagenta";
+        case 0x0200c4: return "eSupplyWarrantyTriggerPointYellow";
+        case 0x0200c5: return "eSupplyWarrantyTriggerPointDrum";
+        case 0x0200c6: return "eSupplyCrgRegionCodeK";
+        case 0x0200c7: return "eSupplyCrgRegionCodeC";
+        case 0x0200c8: return "eSupplyCrgRegionCodeM";
+        case 0x0200c9: return "eSupplyCrgRegionCodeY";
+        case 0x0200ca: return "eSupplyCrgRegionCodeD";
+        case 0x0200cb: return "eSupplyPFDGeneratorK";
+        case 0x0200cc: return "eSupplyPFDGeneratorC";
+        case 0x0200cd: return "eSupplyPFDGeneratorM";
+        case 0x0200ce: return "eSupplyPFDGeneratorY";
+        case 0x0200cf: return "eSupplyCSTDeltaK";
+        case 0x0200d0: return "eSupplyCSTDeltaC";
+        case 0x0200d1: return "eSupplyCSTDeltaM";
+        case 0x0200d2: return "eSupplyCSTDeltaY";
+        case 0x0200d3: return "eSupplyCSTDeltaD";
+        case 0x0200d4: return "eSupplyPCR8001MissingK";
+        case 0x0200d5: return "eSupplyPCR8001MissingC";
+        case 0x0200d6: return "eSupplyPCR8001MissingM";
+        case 0x0200d7: return "eSupplyPCR8001MissingY";
+        case 0x0200d8: return "eSupplyPCR8001MissingD";
+        case 0x0200d9: return "eSupplyUIOverrides";
+        case 0x0200da: return "eSupplyPagesAtLastCleaning";
+        case 0x0200db: return "eSupplyPageCountOHPBlack";
+        case 0x0200dc: return "eSupplyPageCountOHPColor";
+        case 0x0200dd: return "eSupplyB2GraceLimit";
+        case 0x0200de: return "eSupplyCrgMfgDateBlack";
+        case 0x0200df: return "eSupplyCrgMfgDateCyan";
+        case 0x0200e0: return "eSupplyCrgMfgDateMagenta";
+        case 0x0200e1: return "eSupplyCrgMfgDateYellow";
+        case 0x0200e2: return "eSupplyCrgMfgDateDrum";
+        case 0x0200e3: return "eSupplyCrgSerialNumBlack";
+        case 0x0200e4: return "eSupplyCrgSerialNumCyan";
+        case 0x0200e5: return "eSupplyCrgSerialNumMagenta";
+        case 0x0200e6: return "eSupplyCrgSerialNumYellow";
+        case 0x0200e7: return "eSupplyCrgSerialNumDrum";
+        case 0x0200e8: return "eSupplyPixelsPrintedBlack";
+        case 0x0200e9: return "eSupplyPixelsPrintedCyan";
+        case 0x0200ea: return "eSupplyPixelsPrintedMagenta";
+        case 0x0200eb: return "eSupplyPixelsPrintedYellow";
+        case 0x0200ec: return "eSupplyPagesTillPromptBlack";
+        case 0x0200ed: return "eSupplyPagesTillPromptCyan";
+        case 0x0200ee: return "eSupplyPagesTillPromptMagenta";
+        case 0x0200ef: return "eSupplyPagesTillPromptYellow";
+        case 0x0200f0: return "eSupplyPagesTillPromptDrum";
+        case 0x0200f1: return "eSupplyCrgCountOHPBlack";
+        case 0x0200f2: return "eSupplyCrgCountOHPColor";
+        case 0x0200f3: return "eSupplyCrgLifeBlack";
+        case 0x0200f4: return "eSupplyCrgLifeCyan";
+        case 0x0200f5: return "eSupplyCrgLifeMagenta";
+        case 0x0200f6: return "eSupplyCrgLifeYellow";
+        case 0x0200f7: return "eSupplyCrgLifeDrum";
+        case 0x0200f8: return "eSupplyCrgModelBlack";
+        case 0x0200f9: return "eSupplyCrgModelCyan";
+        case 0x0200fa: return "eSupplyCrgModelMagenta";
+        case 0x0200fb: return "eSupplyCrgModelYellow";
+        case 0x0200fc: return "eSupplyCrgModelDrum";
+        case 0x0200fd: return "eSupplyPageCountBlack";
+        case 0x0200fe: return "eSupplyPageCountCyan";
+        case 0x0200ff: return "eSupplyPageCountMagenta";
+        case 0x020100: return "eSupplyPageCountYellow";
+        case 0x020101: return "eSupplyPageCountDrum";
+        case 0x020102: return "eSupplyPageYieldBlack";
+        case 0x020103: return "eSupplyPageYieldCyan";
+        case 0x020104: return "eSupplyPageYieldMagenta";
+        case 0x020105: return "eSupplyPageYieldYellow";
+        case 0x020106: return "eSupplyPageYieldDrum";
+        case 0x020107: return "OOBEState";
+        case 0x020108: return "eEngineNegotiatedBaud";
+        case 0x020109: return "ePrint_TotalImpressions";
+        case 0x02010a: return "ePrint_Print_TotalImpressions";
+        case 0x02010b: return "ePrint_Copy_TotalImpressions";
+        case 0x02010c: return "ePrint_FaxIn_TotalImpressions";
+        case 0x02010d: return "ColdResetMediaSize";
+        case 0x02010e: return "ePrint_TotalSheets";
+        case 0x02010f: return "ePrint_SimplexSheets";
+        case 0x020110: return "ePrint_DuplexSheets";
+        case 0x020111: return "SCPayload";
+        case 0x020112: return "SCProtected";
+        case 0x020113: return "SCSignature";
+        case 0x020114: return "SCProtected1";
+        case 0x020115: return "SCSignature1";
+        case 0x020116: return "SCProtected2";
+        case 0x020117: return "SCSignature2";
+        case 0x020118: return "eScan_TotalCount";
+        case 0x020119: return "eScan_CopyTotalCount";
+        case 0x02011a: return "eScan_FaxTotalCount";
+        case 0x02011b: return "eScan_OtherTotalCount";
+        case 0x02011c: return "LastCprPageCount";
+        case 0x02011d: return "LastCombinedCprDhalfPageCount";
+        case 0x02011e: return "CloudResetCounter";
+        case 0x02011f: return "eFormatterDirtyBit";
+        case 0x020120: return "afax_images_received_from_pc";
+        case 0x020121: return "eJobCount_Email";
+        case 0x020122: return "eJobCount_Folder";
+        case 0x020123: return "eJobCount_ReceiveFax";
+        case 0x020124: return "eJobCount_SendFax";
+        case 0x020125: return "CloudIssuanceCounter";
+        case 0x020126: return "DisableAutoEngineFWUpdate";
+        case 0x020127: return "eEngineHardwareVersion_Engine";
+        case 0x020128: return "eEngineHardwareVersion_OPF";
+        case 0x020129: return "eEngineFWUpdateRetryCounter";
+        case 0x02012a: return "eSupplyCrgFmtrColorPCK";
+        case 0x02012b: return "eSupplyCrgFmtrColorPCC";
+        case 0x02012c: return "eSupplyCrgFmtrColorPCM";
+        case 0x02012d: return "eSupplyCrgFmtrColorPCY";
+        case 0x02012e: return "eSupplyCrgFmtrColorPCD";
+        case 0x02012f: return "SecureStorageAccessToken";
+        case 0x020130: return "enginePageCountForLastCalPageAttempt";
+        case 0x020131: return "enginePageCountForLastCalPageSuccess";
+        case 0x020132: return "enginePageCountForLastCalPageFailure";
+        case 0x020133: return "enginePageCountForLastCalPageCancel";
+        case 0x020134: return "enginePageCountForLastCalPageTrigger";
+        case 0x020135: return "engineLastCalPageStatus";
+        case 0x020136: return "engineLastCalPageScannerStatus";
+        case 0x020137: return "engineCalPageSuccessfulCounts";
+        case 0x020138: return "engineCalPageFailedCounts";
+        case 0x020139: return "engineCalPageCancelledCounts";
+        case 0x02013a: return "engineCalPageSkippedCounts";
+        case 0x02013b: return "enginePenAlignmentOffsets";
+        case 0x02013c: return "engineLinefeedOffsets";
+        case 0x02013d: return "enginePaperEdgeOffsets";
+        case 0x02013e: return "engineSensorToPenHorizontalOffset";
+        case 0x02013f: return "engineSensorToPenVerticalOffset";
+        case 0x020140: return "engineSensorFieldOfViewXOffset";
+        case 0x020141: return "engineSensorFieldOfViewYOffset";
+        case 0x020142: return "engineLowerDropWeightOffset";
+        case 0x020143: return "engineCalibrationDefaultReset";
+        case 0x020144: return "enginePenAligmentDefaults";
+        case 0x020145: return "engineLinefeedDefaults";
+        case 0x020146: return "engineCalibrationDefaultValid";
+        case 0x020147: return "engineCalibrationPageLinefeedCounter";
+        case 0x020148: return "enginePrintheadCalibrationNeeded";
+        case 0x020149: return "enginePenAlignmentFailureCounter";
+        case 0x02014a: return "engineCalibrationPageDefaultCustomerMediaSize";
+        case 0x02014b: return "engineFullBleedThreeInkPageCount";
+        case 0x02014c: return "engineFullBleedSixInkPageCount";
+        case 0x02014d: return "engineManualColorCalibrationValues";
+        case 0x02014e: return "engineBorderlessCompositeBlackCount";
+        case 0x02014f: return "engineBorderlessCompositeBlackBuckets";
+        case 0x020150: return "engineBlackNozzleOuts";
+        case 0x020151: return "engineCyanNozzleOuts";
+        case 0x020152: return "engineMagentaNozzleOuts";
+        case 0x020153: return "engineYellowNozzleOuts";
+        case 0x020154: return "engineDryTimeSetting";
+        case 0x020155: return "XM_DEFERRED_SERVICE_ROUTINE";
+        case 0x020156: return "XM_SS_REAR_RESIDUAL_BINDING";
+        case 0x020157: return "XM_SS_FORWARD_RESIDUAL_BINDING";
+        case 0x020158: return "XM_PAPER_JAM_CARRIAGE_POSITION";
+        case 0x02015a: return "XM_SERVICE_STATE_SACM_K";
+        case 0x02015b: return "XM_SERVICE_STATE_SACM_C";
+        case 0x02015c: return "XM_SERVICE_STATE_SACM_M";
+        case 0x02015d: return "XM_SERVICE_STATE_SACM_Y";
+        case 0x02015e: return "XM_USE_SS_VENT_TO_PRIME";
+        case 0x02015f: return "XM_ASSERT_ON_WVL_SERVICE";
+        case 0x020160: return "XM_LFA_VERT_TEMPERATURE_ADJUST_OUTPUT";
+        case 0x020161: return "XM_DPU_STARTED_COUNTER";
+        case 0x020162: return "XM_DPU_COMPLETED_COUNTER";
+        case 0x020163: return "XM_DPU_FAILED_COUNTER";
+        case 0x020164: return "XM_SENSOR_PREV_TOF_FAILURE_DIFF";
+        case 0x020165: return "XM_MECH_TOTAL_COUNT_PICK_WHILE_SERVICE";
+        case 0x020166: return "XM_MECH_COUNTER_PICK_WHILE_PUMP";
+        case 0x020167: return "XM_MECH_TOTAL_COUNT_GLOSSY_3RD_PICK";
+        case 0x020168: return "XM_MECH_TOTAL_COUNT_PLAIN_3RD_PICK";
+        case 0x020169: return "XM_MECH_COUNT_SHORT_MEDIA_LENGTH_UNDER_MAX";
+        case 0x02016a: return "XM_MECH_COUNT_SHORT_MEDIA_LENGTH_UNDER_MID";
+        case 0x02016b: return "XM_MECH_COUNT_SHORT_MEDIA_LENGTH_UNDER";
+        case 0x02016c: return "XM_MECH_COUNT_SHORT_MEDIA_LENGTH_OVER_MAX";
+        case 0x02016d: return "XM_MECH_COUNT_SHORT_MEDIA_LENGTH_OVER_MID";
+        case 0x02016e: return "XM_MECH_COUNT_SHORT_MEDIA_LENGTH_OVER";
+        case 0x02016f: return "XM_CARRIAGE_THERMAL_PROTECTION_PAGE_COUNT";
+        case 0x020170: return "XM_BOFTE_PRINTSWEEP_CONFIG";
+        case 0x020171: return "XM_DUPLEXER_INSTALLED";
+        case 0x020172: return "XM_AUTOPUMP_DISABLE";
+        case 0x020173: return "XM_SS_BACKLASH_ERROR";
+        case 0x020174: return "XM_SS_CALIBRATION_COUNT";
+        case 0x020175: return "XM_SS_CALIBRATED_AT_PAGE";
+        case 0x020176: return "XM_SS_BINDING_ERROR_FRONT";
+        case 0x020177: return "XM_SS_BINDING_ERROR_REAR";
+        case 0x020178: return "XM_PEN_SERVICE_COUNTER_DECAP_LOOKAHEAD";
+        case 0x020179: return "XM_PEN_SERVICE_COUNTER_UNCAP_LEVEL_0";
+        case 0x02017a: return "XM_PEN_SERVICE_COUNTER_UNCAP_LEVEL_1";
+        case 0x02017b: return "XM_MECH_PRETRIGGERED_OOPS_COUNT";
+        case 0x02017c: return "XM_MECH_PRETRIGGERED_OOPS_FROM_KICK_COUNT";
+        case 0x02017d: return "XM_PEN_SERVICE_COUNTER_UNCAP_LEVEL_2";
+        case 0x02017e: return "XM_PEN_SERVICE_COUNTER_UNCAP_LEVEL_3";
+        case 0x02017f: return "XM_PEN_SERVICE_COUNTER_UNCAP_LEVEL_4";
+        case 0x020180: return "XM_PEN_SERVICE_COUNTER_UNCAP_LEVEL_5";
+        case 0x020181: return "XM_PEN_SERVICE_COUNTER_MIDJOB_LEVEL_0_0";
+        case 0x020182: return "XM_PEN_SERVICE_COUNTER_MIDJOB_LEVEL_0_1";
+        case 0x020183: return "XM_PEN_SERVICE_COUNTER_MIDJOB_LEVEL_0_2";
+        case 0x020184: return "XM_PEN_SERVICE_COUNTER_MIDJOB_LEVEL_1";
+        case 0x020185: return "XM_PEN_SERVICE_COUNTER_MIDJOB_LEVEL_2";
+        case 0x020186: return "XM_PEN_SERVICE_COUNTER_CAP_LEVEL_0";
+        case 0x020187: return "XM_PEN_SERVICE_COUNTER_CAP_LEVEL_1";
+        case 0x020188: return "XM_PEN_SERVICE_COUNTER_CAP_LEVEL_2";
+        case 0x020189: return "XM_PEN_SERVICE_COUNTER_CAP_LEVEL_3";
+        case 0x02018a: return "XM_PEN_SERVICE_COUNTER_PEN_RECOVERY_LEVEL_0";
+        case 0x02018b: return "XM_PEN_SERVICE_COUNTER_PEN_RECOVERY_LEVEL_1";
+        case 0x02018c: return "XM_PEN_SERVICE_COUNTER_PEN_RECOVERY_LEVEL_2";
+        case 0x02018d: return "XM_PEN_SERVICE_COUNTER_POST_CALIBRATION_LEVEL_0";
+        case 0x02018e: return "XM_PEN_SERVICE_COUNTER_POST_IDS_LEVEL_0";
+        case 0x02018f: return "XM_PEN_SERVICE_COUNTER_POST_IDS_LEVEL_1";
+        case 0x020190: return "XM_PEN_SERVICE_COUNTER_POST_IDS_LEVEL_2";
+        case 0x020191: return "XM_PEN_SERVICE_COUNTER_DECAP_LEVEL_0";
+        case 0x020192: return "XM_PEN_SERVICE_COUNTER_DECAP_LEVEL_1";
+        case 0x020193: return "XM_PEN_SERVICE_COUNTER_DECAP_LEVEL_2";
+        case 0x020194: return "XM_PEN_SERVICE_COUNTER_DIRTY_POWERUP_LEVEL_0";
+        case 0x020195: return "XM_PEN_SERVICE_COUNTER_DIRTY_POWERUP_LEVEL_1";
+        case 0x020196: return "XM_PEN_SERVICE_COUNTER_DIRTY_POWERUP_LEVEL_2";
+        case 0x020197: return "XM_PEN_SERVICE_COUNTER_DIRTY_POWERUP_LEVEL_3";
+        case 0x020198: return "XM_PEN_SERVICE_COUNTER_CLEAN_POWERUP_LEVEL_0";
+        case 0x020199: return "XM_PEN_SERVICE_COUNTER_CLEAN_POWERUP_LEVEL_1";
+        case 0x02019a: return "XM_PEN_SERVICE_COUNTER_POST_STARTUP_LEVEL_0";
+        case 0x02019b: return "XM_PEN_SERVICE_COUNTER_WVL";
+        case 0x02019c: return "XM_PEN_SERVICE_COUNTER_SACM";
+        case 0x02019d: return "XM_SERVICE_COUNTER_FORWARD_HOME";
+        case 0x02019e: return "XM_SERVICE_COUNTER_REAR_HOME";
+        case 0x02019f: return "XM_SERVICE_COUNTER_UNCAP";
+        case 0x0201a0: return "XM_SERVICE_COUNTER_CAP";
+        case 0x0201a1: return "XM_SERVICE_COUNTER_WIPE_PENS";
+        case 0x0201a2: return "XM_SERVICE_COUNTER_SCRAPE";
+        case 0x0201a3: return "XM_SERVICE_COUNTER_ENGAGE";
+        case 0x0201a4: return "XM_SERVICE_COUNTER_DISENGAGE";
+        case 0x0201a5: return "XM_PEN_PUMP_COUNTER_BLACK_PRIME_LEVEL_0";
+        case 0x0201a6: return "XM_PEN_PUMP_COUNTER_BLACK_PRIME_LEVEL_1";
+        case 0x0201a7: return "XM_PEN_PUMP_COUNTER_BLACK_PRIME_LEVEL_2";
+        case 0x0201a8: return "XM_SS_CAL_ENABLED";
+        case 0x0201a9: return "XM_SS_SHUTTLE_TRAVEL_DIST";
+        case 0x0201aa: return "XM_SS_CAL_STATE";
+        case 0x0201ab: return "XM_SS_SHUTTLE_TRAVEL_DIST_0";
+        case 0x0201ac: return "XM_SS_SHUTTLE_TRAVEL_DIST_1";
+        case 0x0201ad: return "XM_SS_SHUTTLE_TRAVEL_DIST_2";
+        case 0x0201ae: return "XM_SS_SHUTTLE_TRAVEL_DIST_3";
+        case 0x0201af: return "XM_SS_SHUTTLE_TRAVEL_DIST_4";
+        case 0x0201b0: return "XM_SS_SHUTTLE_TRAVEL_DIST_5";
+        case 0x0201b1: return "XM_SS_SHUTTLE_TRAVEL_DIST_6";
+        case 0x0201b2: return "XM_SS_SHUTTLE_TRAVEL_DIST_7";
+        case 0x0201b3: return "XM_SS_SHUTTLE_TRAVEL_DIST_8";
+        case 0x0201b4: return "XM_SS_SHUTTLE_TRAVEL_DIST_9";
+        case 0x0201b5: return "XM_SS_SHUTTLE_TRAVEL_DIST_COUNT";
+        case 0x0201b6: return "XM_SS_SHUTTLE_TRAVEL_DIST_INDEX";
+        case 0x0201b7: return "XM_SS_SHUTTLE_TRAVEL_DIST_AVG";
+        case 0x0201b8: return "XM_SERVICE_STATION_ENGAGE_FAIL_COUNT";
+        case 0x0201b9: return "XM_SS_BINDING_REAR_FAILURE_COUNT";
+        case 0x0201ba: return "XM_SS_BINDING_FRONT_FAILURE_COUNT";
+        case 0x0201bb: return "XM_COUNTER_SERVICE_STATION_FORWARD_HOME_SHORT";
+        case 0x0201bc: return "XM_COUNTER_SERVICE_STATION_FORWARD_HOME_LONG";
+        case 0x0201bd: return "XM_COUNTER_SERVICE_STATION_REAR_HOME_LONG";
+        case 0x0201be: return "XM_COUNTER_SERVICE_STATION_SHUTTLE_MOVE_STALL";
+        case 0x0201c1: return "XM_SS_CAL_STATE_PREV";
+        case 0x0201c2: return "XM_SS_CALIBRATION_COUNT_TOTAL";
+        case 0x0201c3: return "XM_SS_CALIBRATION_COUNT_ATTEMPTED";
+        case 0x0201c4: return "XM_COUNTER_SERVICE_STATION_BACKLASH_CAL_FAILURE";
+        case 0x0201c5: return "XM_COUNTER_PEN_PUMP_ENGAGE_FAILURE_PRIME";
+        case 0x0201c6: return "XM_SS_CAL_SERVICE_STATION_FAIL_COUNT";
+        case 0x0201c7: return "XM_DOOR_OPENED_SINCE_CAP";
+        case 0x0201c8: return "XM_PHA_PREVIOUSLY_DETECTED";
+        case 0x0201c9: return "XM_DISABLE_PRIMING";
+        case 0x0201ca: return "XM_OOBE_STATE";
+        case 0x0201cb: return "XM_COUNTER_PUMP_CYCLES_TOTAL";
+        case 0x0201cc: return "XM_COUNTER_PUMP_DURATION_TOTAL";
+        case 0x0201cd: return "XM_PEN_SERVICE_EXEC_TIME_UNCAP_LEVEL_5";
+        case 0x0201ce: return "XM_PEN_SERVICE_EXEC_TIME_UNCAP_LEVEL_2";
+        case 0x0201cf: return "XM_PEN_SERVICE_EXEC_TIME_UNCAP_LEVEL_1";
+        case 0x0201d0: return "XM_PEN_SERVICE_EXEC_TIME_UNCAP_LEVEL_0";
+        case 0x0201d1: return "XM_PEN_SERVICE_EXEC_TIME_MIDJOB_LEVEL_1";
+        case 0x0201d2: return "XM_PEN_SERVICE_EXEC_TIME_CAP_LEVEL_1";
+        case 0x0201d3: return "XM_PEN_SERVICE_EXEC_TIME_CAP_LEVEL_0";
+        case 0x0201d4: return "XM_PEN_SERVICE_EXEC_TIME_PEN_RECOVERY_LEVEL_0";
+        case 0x0201d5: return "XM_PEN_SERVICE_EXEC_TIME_POST_CALIBRATION_LEVEL_0";
+        case 0x0201d6: return "XM_PEN_SERVICE_EXEC_TIME_WVL";
+        case 0x0201d7: return "XM_PEN_SERVICE_EXEC_TIME_SACM";
+        case 0x0201d8: return "XM_PEN_SERVICE_COUNTER_DECAP_TIMED";
+        case 0x0201d9: return "XM_PEN_SERVICE_EXEC_TIME_DIRTY_POWERUP_LEVEL_1";
+        case 0x0201da: return "XM_PEN_SERVICE_EXEC_TIME_DIRTY_POWERUP_LEVEL_0";
+        case 0x0201db: return "XM_PEN_SERVICE_EXEC_TIME_CLEAN_POWERUP_LEVEL_1";
+        case 0x0201dc: return "XM_PEN_SERVICE_EXEC_TIME_CLEAN_POWERUP_LEVEL_0";
+        case 0x0201dd: return "XM_EDGE_FACTORY_CAL_A";
+        case 0x0201de: return "XM_CNTR_NUM_PAGES_BETWEEN_OUTPUT_JAMS";
+        case 0x0201df: return "XM_TOTAL_TRAY2_PAGE_COUNT";
+        case 0x0201e0: return "XM_SERVICE_STATION_DISENGAGE_FAIL_COUNT";
+        case 0x0201e1: return "XM_OPTIONAL_TRAY_INSTALLED";
+        case 0x0201e2: return "XM_MECH_PICK_MOTOR_STALL_COUNT";
+        case 0x0201e3: return "XM_LINEFEED_ADJUST_ENABLED";
+        case 0x0201e4: return "XM_SERVICE_STATION_TORQUE_LIMIT";
+        case 0x0201e5: return "XM_BASEMECH_TORQUE_AT_PAPER_FEEDSHAFT";
+        case 0x0201e6: return "XM_GENERAL_DEBUG";
+        case 0x0201e7: return "XM_SLIPPAGE_OFFSETS_ENABLED";
+        case 0x0201e8: return "XM_POST_PRIME_SERVICE_COUNTER";
+        case 0x0201e9: return "XM_LOAD_TRD_PLUNGETHRU_BEHAVIOR";
+        case 0x0201ea: return "XM_MECH_PLUNGE_THRU_COUNTER";
+        case 0x0201eb: return "XM_MECH_PREV_JOB_IS_COLOR";
+        case 0x0201ec: return "XM_USER_SELECTED_MEDIA_SOURCE";
+        case 0x0201ed: return "peTray1OpenCloseCounter";
+        case 0x0201ee: return "peTray2OpenCloseCounter";
+        case 0x0201ef: return "pagesPrintPC";
+        case 0x0201f0: return "pagesPrintHagaki";
+        case 0x0201f1: return "pagesPrint4x6Or10x15";
+        case 0x0201f2: return "pagesPrintMechDraft";
+        case 0x0201f3: return "pagesPrintMechLowerTray";
+        case 0x0201f4: return "pagesPrintMechBest";
+        case 0x0201f5: return "peIIRDeclare";
+        case 0x0201f6: return "peMaintLastRunTimes";
+        case 0x0201f7: return "peSafeModePageNumber";
+        case 0x0201f8: return "peSafeModeRecoveryCycle";
+        case 0x0201f9: return "noMechMode";
+        case 0x0201fa: return "peMaintLastRunTimesSpecMedia";
+        case 0x0201fb: return "pagesPrintMechEnvelopes";
+        case 0x0201fc: return "cntrPagesPrintMechPlain";
+        case 0x0201fd: return "cntrPagesPrintMechPhoto";
+        case 0x0201fe: return "cntrPagesDuplexor";
+        case 0x0201ff: return "cntrPagesPrintMechPhotoTray";
+        case 0x020200: return "cntrPagesPrintMech4x6";
+        case 0x020201: return "cntrPagesPrintMech5x7";
+        case 0x020202: return "cntrPagesPrintMech8x10";
+        case 0x020203: return "cntrPagesPrintMechA4Letter";
+        case 0x020204: return "ctrPgPrintMechPlNorm";
+        case 0x020205: return "ctrPgPrintMechPlFast";
+        case 0x020206: return "ctrPgPrintMechPlBett";
+        case 0x020207: return "ctrPgPrintMechPhotoNorm";
+        case 0x020208: return "ctrPgPrintMechPhotoBett";
+        case 0x020209: return "ctrPgPrintMechA3BsizeMed";
+        case 0x02020a: return "CtrBktPlPgPerJobEq1";
+        case 0x02020b: return "CtrBktPlPgPerJobEq2";
+        case 0x02020c: return "CtrBktPlPgPerJob3To5";
+        case 0x02020d: return "CtrBktPlPgPerJob6To10";
+        case 0x02020e: return "CtrBktPhPgPerJobEq1";
+        case 0x02020f: return "CtrBktPhPgPerJobEq2";
+        case 0x020210: return "CtrBktPhPgPerJob3To5";
+        case 0x020211: return "CtrBktPhPgPerJob6to10";
+        case 0x020212: return "CtrBktPlPgPerJobGt10";
+        case 0x020213: return "CtrBktPhPgPerJobGt10";
+        case 0x020214: return "cntrTotalImpressionsPrinted";
+        case 0x020215: return "cntrEnvelopeImpressionsPrinted";
+        case 0x020216: return "cntr4x6ImpressionsPrinted";
+        case 0x020217: return "cntr5x7ImpressionsPrinted";
+        case 0x020218: return "cntr8x10ImpressionsPrinted";
+        case 0x020219: return "cntrA4LetterImpressionsPrinted";
+        case 0x02021a: return "cntrDuplexorSheetsPrinted";
+        case 0x02021b: return "cntrUserRequestPrimes";
+        case 0x02021c: return "cntrPagesPrintMechPqMaxDpi";
+        case 0x02021d: return "cntrLegalImpressionsPrinted";
+        case 0x02021e: return "cntrMpA4LetterImpressionsPrinted";
+        case 0x02021f: return "cntrMpEnvelopeImpressionsPrinted";
+        case 0x020220: return "cntrMpLegalImpressionsPrinted";
+        case 0x020221: return "cntrPagesPrintMechLowerTray";
+        case 0x020222: return "cntrPagesPrint4x6Or10x15";
+        case 0x020223: return "cntrPagesPrintPc";
+        case 0x020224: return "cntrPagesPrintPhoto";
+        case 0x020225: return "cntrMonoKImpressionsPrinted";
+        case 0x020226: return "cntrTotalImpressionsPrintedQm";
+        case 0x020227: return "cntrA5ImpressionsPrinted";
+        case 0x020228: return "cntrB5ImpressionsPrinted";
+        case 0x020229: return "cntr3x5ImpressionsPrinted";
+        case 0x02022a: return "cntrJpn100x148ImpressionsPrinted";
+        case 0x02022b: return "cntrL89x127ImpressionsPrinted";
+        case 0x02022c: return "cntrJpn200x148ImpressionsPrinted";
+        case 0x02022d: return "cntr4x5ImpressionsPrinted";
+        case 0x02022e: return "cntrPlainImpressionsPrinted";
+        case 0x02022f: return "cntrPhotoImpressionsPrinted";
+        case 0x020230: return "cntr5x5ImpressionsPrinted";
+        case 0x020231: return "cntr4x12ImpressionsPrinted";
+        case 0x020232: return "PrintPageCountPclxl";
+        case 0x020233: return "PrintPageCountPclxlColor";
+        case 0x020234: return "PrintPageCountPclxlMono";
+        case 0x020235: return "PrintPageCountPcl";
+        case 0x020236: return "PrintPageCountPclColor";
+        case 0x020237: return "PrintPageCountPclMono";
+        case 0x020238: return "PrintPageCountPostScript";
+        case 0x020239: return "PrintPageCountPostScriptColor";
+        case 0x02023a: return "PrintPageCountPostScriptMono";
+        case 0x02023b: return "PrintPageCountPdf";
+        case 0x02023c: return "PrintPageCountPdfColor";
+        case 0x02023d: return "PrintPageCountPdfMono";
+        case 0x02023e: return "engineNumJobsAfterNewPen";
+        case 0x02023f: return "engineNumAttemptsToSendPenCalEvent";
+        case 0x020240: return "eJobCount_Copy";
+        case 0x020241: return "eJobCount_Print";
+        case 0x020242: return "eJobCount_InternalStorage";
+        case 0x020243: return "eJobCount_RemovalStorage";
+        case 0x020244: return "trayDefaultPaperType";
+        case 0x020245: return "trayDefaultPaperSize";
+        case 0x020246: return "trayAnyPaperType";
+        case 0x020247: return "trayAnyPaperSize";
+        case 0x020248: return "trayFeedOrientation";
+        case 0x020249: return "trayAnyCustom";
+        case 0x02024a: return "trayAnyCustomWidth";
+        case 0x02024b: return "trayAnyCustomLength";
+        case 0x02024c: return "traySavedMinGuideWidth";
+        case 0x02024d: return "traySavedMinGuideLength";
+        case 0x02024e: return "trayDefaultGroupSize";
+        case 0x02024f: return "trayDefaultGroupType";
+        case 0x020250: return "trayFactoryDefaultGroupSize";
+        case 0x020251: return "trayFactoryDefaultGroupType";
+        case 0x020252: return "defaultMediaSize";
+        case 0x020253: return "defaultMediaType";
+        case 0x020254: return "mpTrayMaxWidth";
+        case 0x020255: return "mpTrayMinWidth";
+        case 0x020256: return "traySensorEnabled";
+        case 0x020257: return "laserColdResetMediaSize";
+        case 0x020258: return "alternativeDefaultMediaType";
+        case 0x020259: return "sensorMewRefMin";
+        case 0x02025a: return "sensorMewRefMax";
+        case 0x02025b: return "sensorMewRefMid";
+        case 0x02025c: return "spotLedbPlaincal";
+        case 0x02025d: return "spotLedCountsAtCal";
+        case 0x02025e: return "spotSystemBrightnessCalStatus";
+        case 0x02025f: return "spotLedbQuickcalDiffuse";
+        case 0x020260: return "systemLedCalPageCounter";
+        case 0x020261: return "spotLvtgRatioPlain";
+        case 0x020262: return "spotLedCountsAtQuickcal";
+        case 0x020263: return "spotSpecularCountsAtCal";
+        case 0x020264: return "peCntrOutputBinFull";
+        case 0x020265: return "mediaWidthPolicyMruSizes";
+        case 0x020266: return "mediaWidthMewStatisticsTable";
+        case 0x020267: return "mediaWidthPolicySensorChoice";
+        case 0x020268: return "eSupplyRefillDetectPixelCounterBlack";
+        case 0x020269: return "eSupplyRefillDetectPixelCounterCyan";
+        case 0x02026a: return "eSupplyRefillDetectPixelCounterMagenta";
+        case 0x02026b: return "eSupplyRefillDetectPixelCounterYellow";
+        case 0x02026c: return "eSupplyRefillDetectLimitBlack";
+        case 0x02026d: return "eSupplyRefillDetectLimitCyan";
+        case 0x02026e: return "eSupplyRefillDetectLimitMagenta";
+        case 0x02026f: return "eSupplyRefillDetectLimitYellow";
+        case 0x02031a: return "ScanRediLengthSns3Info";
+        case 0x02031b: return "ScanAltNvmRediLengthSens3Info";
+        case 0x02031c: return "ScanSavedRediLengthSens3Info";
+        case 0x02031d: return "AdfPageWidthCalP0";
+        case 0x02031e: return "AdfPageWidthCalP1";
+        case 0x02031f: return "AdfPageWidthCalP2";
+        case 0x020320: return "CtrPgScanMechAdf";
+        case 0x020321: return "CtrPgScanMechAdfErrors";
+        case 0x020322: return "CntrPagesDuplexingAdf";
+        case 0x020323: return "AdfMgrIndigoScanVelocity";
+        case 0x020324: return "AdfMgrSens1LeadingTweak";
+        case 0x020325: return "AdfMgrSens2LeadingTweak";
+        case 0x020326: return "AdfMgrSens1TrailingTweak";
+        case 0x020327: return "AdfMgrSens2TrailingTweak";
+        case 0x020328: return "AdfMgrMarginCalRevision";
+        case 0x020329: return "AdfMgrSensDistanceRevision";
+        case 0x02032a: return "AdfMgrUltraSensStop";
+        case 0x02032b: return "AdfMgrMediaSenseThreshold";
+        case 0x02032c: return "AdfMgrNoPaperThreshold";
+        case 0x02032d: return "AdfMgrMultiPickThreshold";
+        case 0x02032e: return "AdfMgrPwmDrvValue";
+        case 0x02032f: return "AdfMgrThermalDutyCycle";
+        case 0x020330: return "AdfMgrThermalDutyCycleEpoch";
+        case 0x020331: return "AdfMgrThermTempFeed";
+        case 0x020332: return "AdfMgrThermTempDeskew";
+        case 0x020333: return "AdfMgrThermTempEpoch";
+        case 0x020334: return "CntrAdfPickPages";
+        case 0x020335: return "CntrAdfTotalScans";
+        case 0x020336: return "CntrAdfDuplexScans";
+        case 0x020337: return "CntrAdfJam";
+        case 0x020338: return "CntrAdfMispick";
+        case 0x020339: return "CntrAdfTotalScansA4EquivalentX10";
+        case 0x02033a: return "CntrAdfDuplexScansA4EquivalentX10";
+        case 0x02033b: return "AdfMgrLastTemperature";
+        case 0x02033c: return "AdfMgrLastTemperatureTime";
+        case 0x02033d: return "AdfMgrThermalLastActiveTime";
+        case 0x02033e: return "AdfMgrThermalDelayPageCount";
+        case 0x02033f: return "AdfMgrAdfDisable";
+        case 0x020340: return "AdfDustScanLineShiftSize";
+        case 0x020341: return "CntrPagesScanMechAdfMispicks";
+        case 0x020342: return "AdfMgrEjectFeedStop";
+        case 0x020343: return "AdfMgrEjectWait";
+        case 0x020344: return "AdfMgrEjectTspeed";
+        case 0x020345: return "AdfMgrEjectSpeedPct";
+        case 0x020346: return "AdfMgrEjectSlowMsec";
+        case 0x020347: return "AdfMgrEjectSpeedPctFast";
+        case 0x020348: return "AdfMgrEjectFastMsec";
+        case 0x020349: return "AdfMgrEjectPastMidr";
+        case 0x02034a: return "AdfMgrRetardmSpeedPct";
+        case 0x02034b: return "AdfMgrPickFailDist";
+        case 0x02034c: return "AdfMgrCatchupSpeedPct";
+        case 0x02034d: return "AdfMgrMaxCatchupSpeed";
+        case 0x02034e: return "AdfMgrGapSpeedPct";
+        case 0x02034f: return "AdfMgrGapAdjust";
+        case 0x020350: return "AdfMgrTargetGap";
+        case 0x020351: return "AdfMgrPgcBegin";
+        case 0x020352: return "AdfMgrPgcEnd";
+        case 0x020353: return "AdfMgrPlifSpeed";
+        case 0x020354: return "AdfMgrPlifDistMax";
+        case 0x020355: return "AdfMgrPliftRaisePast";
+        case 0x020356: return "AdfMgrPliftLowerPast";
+        case 0x020357: return "AdfMgrPliftDownMils";
+        case 0x020358: return "AdfMgrPliftRaisePastRev";
+        case 0x020359: return "AdfMgrAutoReverseMaxDist";
+        case 0x02035a: return "AdfMgrAutoReversePastDist";
+        case 0x02035b: return "AdfMgrAutoReverseSpeed";
+        case 0x02035c: return "AdfMgrTransitrLePast";
+        case 0x02035d: return "AdfMgrTrasitrTePast";
+        case 0x02035e: return "AdfMgrArevTrayDownEc";
+        case 0x02035f: return "AdfMgrHoleLeExclude";
+        case 0x020360: return "AdfMgrHoleMaxSize";
+        case 0x020361: return "AdfMgrEaseRev";
+        case 0x020362: return "AdfOutputTrayMode";
+        case 0x020363: return "AdfOutputTraySpeed";
+        case 0x020364: return "AdfOutputTrayDist";
+        case 0x020365: return "AdfPicksDeskewsSwap";
+        case 0x020366: return "FbScanLength1RediBoostDrive";
+        case 0x020367: return "FbScanLength2RediBoostDrive";
+        case 0x020368: return "Ds2InvalidId";
+        case 0x020369: return "SeError";
+        case 0x02036a: return "ProgrammersBits";
+        case 0x02036b: return "ProgrammersBits2";
+        case 0x02036c: return "EdgeFlagTo1stScanLineMicron";
+        case 0x02036d: return "RollerTo1stScanLineMicron";
+        case 0x02036e: return "MultiPageEjectMicron";
+        case 0x02036f: return "ScanAdfYposOffsetFromNotch";
+        case 0x020370: return "ScanAdfMylarFactors";
+        case 0x020371: return "ScanAdfNoise300";
+        case 0x020372: return "ScanAdfNoiseSlope300";
+        case 0x020373: return "ScanAdfNoise600";
+        case 0x020374: return "ScanAdfNoiseSlope600";
+        case 0x020375: return "ScanAdfStripNoise";
+        case 0x020376: return "ScanAdfStripMeanRed";
+        case 0x020377: return "ScanAdfStripMeanGrn";
+        case 0x020378: return "ScanAdfStripMeanBlu";
+        case 0x020379: return "WeakPixelsIdentified";
+        case 0x02037a: return "WeakScanPixels200";
+        case 0x02037b: return "WeakScanPixels300";
+        case 0x02037c: return "WeakScanPixels600";
+        case 0x02037d: return "ScanModuleSerialLong";
+        case 0x02037e: return "ScanModuleSerialLongBackside";
+        case 0x02037f: return "AdfSerial";
+        case 0x020380: return "IsaSerial";
+        case 0x020381: return "ScanPersistentCalData";
+        case 0x020382: return "ScanPersistentCalDataPco";
+        case 0x020383: return "ScanPersistentCalDataBackside";
+        case 0x020384: return "ScanPersistentCalDataPcoBackside";
+        case 0x020385: return "CScanMvInit";
+        case 0x020386: return "CScanDropLevel";
+        case 0x020387: return "CScanDropThres";
+        case 0x020388: return "IpCorrectionMatrixValid";
+        case 0x020389: return "IpCorrectionMatrix";
+        case 0x02038a: return "IpCorrectionMatrixBarcode";
+        case 0x02038b: return "IpCorrectionMatrixBackside";
+        case 0x02038c: return "IpCorrectionMatrixValidBackside";
+        case 0x02038d: return "IpCorrectionMatrixBarcodeBackside";
+        case 0x02038e: return "ScanModuleTimestamp";
+        case 0x02038f: return "ScanModuleTimestampBackside";
+        case 0x020390: return "AdfthermLastPageTimestamp";
+        case 0x020391: return "AdfthermLastPageCount";
+        case 0x020392: return "AdfthermWindowActive";
+        case 0x020393: return "AltNvmCrc";
+        case 0x020394: return "AltNvmCrcBackside";
+        case 0x020395: return "ScanAltNvmVersion";
+        case 0x020396: return "PrnuTarTweak0AdfFront";
+        case 0x020397: return "PrnuTarTweak1AdfFront";
+        case 0x020398: return "PrnuTarTweak2AdfFront";
+        case 0x020399: return "PrnuTarTweak0AdfBack";
+        case 0x02039a: return "PrnuTarTweak1AdfBack";
+        case 0x02039b: return "PrnuTarTweak2AdfBack";
+        case 0x02039c: return "ScanSmOverride";
+        case 0x02039d: return "AdfDocXTweak";
+        case 0x02039e: return "AdfDocXTweak2";
+        case 0x02039f: return "ScanAdfSkewAdjust";
+        case 0x0203a0: return "ScanCalignCalData";
+        case 0x0203a1: return "OptRunoutOffset";
+        case 0x0203a2: return "OptRunoutSlope";
+        case 0x0203a3: return "OptRunoutAmplitude";
+        case 0x0203a4: return "OptRunoutPhase";
+        case 0x0203a5: return "OptAnalogEncCalSettings";
+        case 0x0203a6: return "OptAnalogEncCalDiagnostics";
+        case 0x0203a7: return "PrnuTarTweakMulti";
+        case 0x0203a8: return "ScanPrnuCalData";
+        case 0x0203a9: return "ScanPrnuCalDataValid";
+        case 0x0203aa: return "ScanPrnuCalDataVersion";
+        case 0x0203ab: return "ScanPrnuCalDataStatus";
+        case 0x0203ac: return "ScanPrnuCalDataUpdated";
+        case 0x0203ad: return "ScalLedCal300MonoValid";
+        case 0x0203ae: return "ScalLedCal600MonoValid";
+        case 0x0203af: return "ScalLedCal1200MonoValid";
+        case 0x0203b0: return "ScalLedCal300MonoData";
+        case 0x0203b1: return "ScalLedCal600MonoData";
+        case 0x0203b2: return "ScalLedCal1200MonoData";
+        case 0x0203b3: return "ScanRediLengthSns1Info";
+        case 0x0203b4: return "ScanRediLengthSns2Info";
+        case 0x0203b5: return "AdfDustDoScanLineShift";
+        case 0x0203b6: return "ScanAltNvmRediLengthSens1Info";
+        case 0x0203b7: return "ScanAltNvmRediLengthSens2Info";
+        case 0x0203b8: return "ScanSavedRediLengthSens1Info";
+        case 0x0203b9: return "ScanSavedRediLengthSens2Info";
+        case 0x0203ba: return "ScanAltNvmRediLengthSensorsSignalInfo";
+        case 0x0203bb: return "CntrPagesScanMech";
+        case 0x0203bc: return "CtrBktAdfPgPerJob1To10";
+        case 0x0203bd: return "CtrBktAdfPgPerJob11To20";
+        case 0x0203be: return "CtrBktAdfPgPerJob21To35";
+        case 0x0203bf: return "CtrBktAdfPgPerJobGT35";
+        case 0x0203c0: return "CntrFltTotalScans";
+        case 0x0203c1: return "CntrTotalScans";
+        case 0x0203c2: return "CntrTotalMonoScans";
+        case 0x0203c3: return "CntrTotalColorScans";
+        case 0x0203c4: return "CntrFltTotalScansA4EquivalentX10";
+        case 0x0203c5: return "CntrBSizePagesScanMech";
+        case 0x0203c6: return "CntrPagesScanMechLegal";
+        case 0x0203c7: return "CntrPagesTotalAdfLegal";
+        case 0x0203c8: return "CntrPagesAdfJob1To10Legal";
+        case 0x0203c9: return "CntrPagesAdfJob11To20Legal";
+        case 0x0203ca: return "CntrPagesAdfJob21To35Legal";
+        case 0x0203cb: return "CntrPagesAdfJobGT35Legal";
+        case 0x0203cc: return "ScanChipBoundary1";
+        case 0x0203cd: return "ScanChipBoundary2";
+        case 0x0203ce: return "ScanChipBoundary3";
+        case 0x0203cf: return "ScanChipBoundary4";
+        case 0x0203d0: return "ScanChipBoundary5";
+        case 0x0203d1: return "ScanChipBoundary6";
+        case 0x0203d2: return "ScanChipBoundary7";
+        case 0x0203d3: return "ScanChipBoundary8";
+        case 0x0203d4: return "ScanChipBoundary9";
+        case 0x0203d5: return "ScanChipBoundary10";
+        case 0x0203d6: return "ScanChipBoundary11";
+        case 0x0203d7: return "ScanChipBoundary12";
+        case 0x0203d8: return "ScanChipBoundary1Extn1";
+        case 0x0203d9: return "ScanChipBoundary2Extn1";
+        case 0x0203da: return "ScanChipBoundary3Extn1";
+        case 0x0203db: return "ScanChipBoundary4Extn1";
+        case 0x0203dc: return "ScanChipBoundary5Extn1";
+        case 0x0203dd: return "ScanChipBoundary6Extn1";
+        case 0x0203de: return "ScanChipBoundary7Extn1";
+        case 0x0203df: return "ScanChipBoundary8Extn1";
+        case 0x0203e0: return "ScanChipBoundary9Extn1";
+        case 0x0203e1: return "ScanChipBoundary10Extn1";
+        case 0x0203e2: return "ScanChipBoundary11Extn1";
+        case 0x0203e3: return "ScanChipBoundary12Extn1";
+        case 0x0203e4: return "InvalidId";
+        case 0x0203e5: return "SmtrDeskewSlewScale";
+        case 0x0203e6: return "SmtrFeedSlewScale";
+        case 0x0203e7: return "SmtrAdfYmagScale";
+        case 0x0203e8: return "ScanAdfSkewAdjustBack";
+        case 0x0203e9: return "IS_TOTAL_INK_INSERTED";
+        case 0x0203ea: return "IS_LOCKED_REGION";
+        case 0x0203eb: return "IS_LOCKED_REGION_SET_AT_MFG";
+        case 0x0203ec: return "IS_ALTERED_PAST";
+        case 0x0203ed: return "IS_EXPIRED_PAST";
+        case 0x0203ee: return "IS_NON_HP_INK";
+        case 0x0203ef: return "IS_CUSTOMER_PRIVACY_ACK_FLAG";
+        case 0x0203f0: return "IS_EXTENDED_WARRANTY_NON_HP_INK_JOB_COUNT";
+        case 0x0203f1: return "IS_OOBE_COMPLETE";
+        case 0x0203f2: return "IS_HOST_OOBE_OVERRIDE_FLAG";
+        case 0x0203f3: return "IS_LOCKOUT_BYPASS_HASH";
+        case 0x0203f4: return "IS_FAKE_SECURE_BEHAVIOR";
+        case 0x0203f5: return "IS_OVERRIDDEN_FIRM_LOG";
+        case 0x0203f6: return "IS_ASSERT_MISSING_UDW";
+        case 0x0203f7: return "IS_IGNORE_ERROR_BITS_1";
+        case 0x0203f8: return "IS_IGNORE_ERROR_BITS_2";
+        case 0x0203f9: return "IS_IGNORE_ERROR_BITS_3";
+        case 0x0203fa: return "IS_IGNORE_ERROR_BITS_4";
+        case 0x0203fb: return "IS_IGNORE_PEN_STARTUP_STATE";
+        case 0x0203fc: return "IS_D3S_ARRAY_K";
+        case 0x0203fd: return "IS_D3S_ARRAY_COLOR";
+        case 0x0203fe: return "IS_SECURE_UPGRADE_OVERALL_ARRAY";
+        case 0x0203ff: return "IS_SECURE_UPGRADE_OVERALL_ARRAY_INDEX";
+        case 0x020400: return "IS_EXTENDED_WARRANTY_NON_HP_INK_USED";
+        case 0x020401: return "IS_NUMBER_OF_D3S_ARRAY_K";
+        case 0x020402: return "IS_NUMBER_OF_D3S_ARRAY_COLOR";
+        case 0x020403: return "IS_D3S_DEFAULT_ENTRIES_MASK_K";
+        case 0x020404: return "IS_D3S_DEFAULT_ENTRIES_MASK_COLOR";
+        case 0x020405: return "IS_ANTI_THEFT_ENABLE";
+        case 0x020406: return "IS_ACUMEN_ID_LIST";
+        case 0x020407: return "IS_ANTI_THEFT_ALTERNATE_ID_COUNT";
+        case 0x020408: return "IS_ANTI_THEFT_ALTERNATE_ID";
+        case 0x020409: return "IS_ANTI_THEFT_ALTERNATE_ID_LOW";
+        case 0x02040a: return "IS_SUBSCRIPTION_EVER_INSTALLED";
+        case 0x02040b: return "IS_T_SCORE";
+        case 0x02040c: return "IS_INTYB";
+        case 0x02040d: return "IS_INTYW";
+        case 0x02040e: return "IS_INTYWV";
+        case 0x02040f: return "IS_INTYWPH";
+        case 0x020410: return "IS_FLEET_ANTI_THEFT_ID";
+        case 0x020411: return "IS_FAKE_FIELD_LIST";
+        case 0x020412: return "IS_MODEL_NAME_APPENDED";
+        case 0x020413: return "IS_MODEL_NUMBER_UPGRADE_LIST";
+        case 0x020414: return "IS_SAFE_MODE_DISABLE";
+        case 0x020415: return "IS_HP_ONLY_MODE";
+        case 0x020416: return "IS_SAFE_STOP_STICKY";
+        case 0x020417: return "IS_P2P_FLAVOR";
+        case 0x020418: return "IS_REGION_RELOCK_METHOD";
+        case 0x020419: return "IS_MFG_UDW_DISABLED";
+        case 0x02041a: return "IS_MFG_FAKE_SECURE_UPGRADE";
+        case 0x02041b: return "IS_LCNS_DISABLE_GRACE_PAGES";
+        case 0x02041c: return "IS_ACUMEN_ID_LIST_LCNS_REMAINING_GRACE_PAGES";
+        case 0x02041d: return "IS_REJECTION_LOG_ARRAY";
+        case 0x02041e: return "IS_ACUMEN_OVERRIDES";
+        case 0x02041f: return "IS_ACUMEN_ID_LIST_CONSTAT_CONSUMABLE";
+        case 0x020420: return "IS_LCNS3_RUN_ALL";
+        case 0x020421: return "IS_VARITRONICS_SUPPLIES_ONLY";
+        case 0x020422: return "IS_SUPPLY_TYPE_DEFAULT_INVALID_MASK";
+        case 0x020423: return "IS_ACUMEN_ID_LIST_REMAN_COUNTER";
+        case 0x020424: return "IS_ACUPACK_GF_DONE";
+        case 0x020425: return "IS_ACUPACK_GF_LIST";
+        case 0x020426: return "IS_TOTAL_HP_INK_INSERTED";
+        case 0x020427: return "IS_PEN_RAPID_SNAPSHOT_EVENTS_COUNT";
+        case 0x020428: return "IS_HP_INK_CONSUMED_K";
+        case 0x020429: return "IS_HP_INK_CONSUMED_C";
+        case 0x02042a: return "IS_HP_INK_CONSUMED_M";
+        case 0x02042b: return "IS_HP_INK_CONSUMED_Y";
+        case 0x02042c: return "IS_HP_INK_CONSUMED_LK";
+        case 0x02042d: return "IS_HP_INK_CONSUMED_FA";
+        case 0x02042e: return "IS_HP_INK_CONSUMED_DA";
+        case 0x02042f: return "IS_HP_INK_CONSUMED_LTFA";
+        case 0x020430: return "IS_INSERT_COUNT_K";
+        case 0x020431: return "IS_INSERT_COUNT_C";
+        case 0x020432: return "IS_INSERT_COUNT_M";
+        case 0x020433: return "IS_INSERT_COUNT_Y";
+        case 0x020434: return "IS_INSERT_COUNT_LK";
+        case 0x020435: return "IS_INSERT_COUNT_FA";
+        case 0x020436: return "IS_INSERT_COUNT_DA";
+        case 0x020437: return "IS_INSERT_COUNT_LTFA";
+        case 0x020438: return "IS_HAS_USER_ACK_K";
+        case 0x020439: return "IS_HAS_USER_ACK_C";
+        case 0x02043a: return "IS_HAS_USER_ACK_M";
+        case 0x02043b: return "IS_HAS_USER_ACK_Y";
+        case 0x02043c: return "IS_HAS_USER_ACK_LK";
+        case 0x02043d: return "IS_HAS_USER_ACK_FA";
+        case 0x02043e: return "IS_HAS_USER_ACK_DA";
+        case 0x02043f: return "IS_HAS_USER_ACK_LTFA";
+        case 0x020440: return "IS_CAP_SYMBOL_K";
+        case 0x020441: return "IS_CAP_SYMBOL_C";
+        case 0x020442: return "IS_CAP_SYMBOL_M";
+        case 0x020443: return "IS_CAP_SYMBOL_Y";
+        case 0x020444: return "IS_CAP_SYMBOL_LK";
+        case 0x020445: return "IS_CAP_SYMBOL_FA";
+        case 0x020446: return "IS_CAP_SYMBOL_DA";
+        case 0x020447: return "IS_CAP_SYMBOL_LTFA";
+        case 0x020448: return "IS_BTM_HAS_USER_ACK_K";
+        case 0x020449: return "IS_BTM_HAS_USER_ACK_C";
+        case 0x02044a: return "IS_BTM_HAS_USER_ACK_M";
+        case 0x02044b: return "IS_BTM_HAS_USER_ACK_Y";
+        case 0x02044c: return "IS_BTM_HAS_USER_ACK_LK";
+        case 0x02044d: return "IS_BTM_HAS_USER_ACK_FA";
+        case 0x02044e: return "IS_BTM_HAS_USER_ACK_DA";
+        case 0x02044f: return "IS_BTM_HAS_USER_ACK_LTFA";
+        case 0x020450: return "IS_STARTUP_COMPLETE_K";
+        case 0x020451: return "IS_STARTUP_COMPLETE_C";
+        case 0x020452: return "IS_STARTUP_COMPLETE_M";
+        case 0x020453: return "IS_STARTUP_COMPLETE_Y";
+        case 0x020454: return "IS_STARTUP_COMPLETE_LK";
+        case 0x020455: return "IS_STARTUP_COMPLETE_FA";
+        case 0x020456: return "IS_STARTUP_COMPLETE_DA";
+        case 0x020457: return "IS_STARTUP_COMPLETE_LTFA";
+        case 0x020458: return "IS_CHANGED_FOR_IDS_ONLY_K";
+        case 0x020459: return "IS_CHANGED_FOR_IDS_ONLY_C";
+        case 0x02045a: return "IS_CHANGED_FOR_IDS_ONLY_M";
+        case 0x02045b: return "IS_CHANGED_FOR_IDS_ONLY_Y";
+        case 0x02045c: return "IS_CHANGED_FOR_IDS_ONLY_LK";
+        case 0x02045d: return "IS_CHANGED_FOR_IDS_ONLY_FA";
+        case 0x02045e: return "IS_CHANGED_FOR_IDS_ONLY_DA";
+        case 0x02045f: return "IS_CHANGED_FOR_IDS_ONLY_LTFA";
+        case 0x020460: return "IS_PAGE_COUNT_K";
+        case 0x020461: return "IS_PAGE_COUNT_C";
+        case 0x020462: return "IS_PAGE_COUNT_M";
+        case 0x020463: return "IS_PAGE_COUNT_Y";
+        case 0x020464: return "IS_PAGE_COUNT_LK";
+        case 0x020465: return "IS_PAGE_COUNT_FA";
+        case 0x020466: return "IS_PAGE_COUNT_DA";
+        case 0x020467: return "IS_PAGE_COUNT_LTFA";
+        case 0x020468: return "IS_DENSITY_X1000_K";
+        case 0x020469: return "IS_DENSITY_X1000_C";
+        case 0x02046a: return "IS_DENSITY_X1000_M";
+        case 0x02046b: return "IS_DENSITY_X1000_Y";
+        case 0x02046c: return "IS_DENSITY_X1000_LK";
+        case 0x02046d: return "IS_DENSITY_X1000_FA";
+        case 0x02046e: return "IS_DENSITY_X1000_DA";
+        case 0x02046f: return "IS_DENSITY_X1000_LTFA";
+        case 0x020470: return "IS_TOTAL_INK_INSERTED_K";
+        case 0x020471: return "IS_TOTAL_INK_INSERTED_C";
+        case 0x020472: return "IS_TOTAL_INK_INSERTED_M";
+        case 0x020473: return "IS_TOTAL_INK_INSERTED_Y";
+        case 0x020474: return "IS_TOTAL_INK_INSERTED_LK";
+        case 0x020475: return "IS_TOTAL_INK_INSERTED_FA";
+        case 0x020476: return "IS_TOTAL_INK_INSERTED_DA";
+        case 0x020477: return "IS_TOTAL_INK_INSERTED_LTFA";
+        case 0x020478: return "IS_SUPPLY_INSERTION_COUNT_K";
+        case 0x020479: return "IS_SUPPLY_INSERTION_COUNT_C";
+        case 0x02047a: return "IS_SUPPLY_INSERTION_COUNT_M";
+        case 0x02047b: return "IS_SUPPLY_INSERTION_COUNT_Y";
+        case 0x02047c: return "IS_SUPPLY_INSERTION_COUNT_LK";
+        case 0x02047d: return "IS_SUPPLY_INSERTION_COUNT_FA";
+        case 0x02047e: return "IS_SUPPLY_INSERTION_COUNT_DA";
+        case 0x02047f: return "IS_SUPPLY_INSERTION_COUNT_LTFA";
+        case 0x020480: return "IS_TRIAL_COUNT_K";
+        case 0x020481: return "IS_TRIAL_COUNT_C";
+        case 0x020482: return "IS_TRIAL_COUNT_M";
+        case 0x020483: return "IS_TRIAL_COUNT_Y";
+        case 0x020484: return "IS_TRIAL_COUNT_LK";
+        case 0x020485: return "IS_TRIAL_COUNT_FA";
+        case 0x020486: return "IS_TRIAL_COUNT_DA";
+        case 0x020487: return "IS_TRIAL_COUNT_LTFA";
+        case 0x020488: return "IS_WAS_HOST_AT_OOBE_K";
+        case 0x020489: return "IS_WAS_HOST_AT_OOBE_C";
+        case 0x02048a: return "IS_WAS_HOST_AT_OOBE_M";
+        case 0x02048b: return "IS_WAS_HOST_AT_OOBE_Y";
+        case 0x02048c: return "IS_WAS_HOST_AT_OOBE_LK";
+        case 0x02048d: return "IS_WAS_HOST_AT_OOBE_FA";
+        case 0x02048e: return "IS_WAS_HOST_AT_OOBE_DA";
+        case 0x02048f: return "IS_WAS_HOST_AT_OOBE_LTFA";
+        case 0x020490: return "IS_LCNS_CONSECUTIVE_GRACE_PAGES_K";
+        case 0x020491: return "IS_LCNS_CONSECUTIVE_GRACE_PAGES_C";
+        case 0x020492: return "IS_LCNS_CONSECUTIVE_GRACE_PAGES_M";
+        case 0x020493: return "IS_LCNS_CONSECUTIVE_GRACE_PAGES_Y";
+        case 0x020494: return "IS_LCNS_CONSECUTIVE_GRACE_PAGES_LK";
+        case 0x020495: return "IS_LCNS_CONSECUTIVE_GRACE_PAGES_FA";
+        case 0x020496: return "IS_LCNS_CONSECUTIVE_GRACE_PAGES_DA";
+        case 0x020497: return "IS_LCNS_CONSECUTIVE_GRACE_PAGES_LTFA";
+        case 0x020498: return "IS_ALTERED_K";
+        case 0x020499: return "IS_ALTERED_C";
+        case 0x02049a: return "IS_ALTERED_M";
+        case 0x02049b: return "IS_ALTERED_Y";
+        case 0x02049c: return "IS_ALTERED_LK";
+        case 0x02049d: return "IS_ALTERED_FA";
+        case 0x02049e: return "IS_ALTERED_DA";
+        case 0x02049f: return "IS_ALTERED_LTFA";
+        case 0x0204a0: return "IS_STATUS_K";
+        case 0x0204a1: return "IS_STATUS_C";
+        case 0x0204a2: return "IS_STATUS_M";
+        case 0x0204a3: return "IS_STATUS_Y";
+        case 0x0204a4: return "IS_STATUS_LK";
+        case 0x0204a5: return "IS_STATUS_FA";
+        case 0x0204a6: return "IS_STATUS_DA";
+        case 0x0204a7: return "IS_STATUS_LTFA";
+        case 0x0204a8: return "IS_FILL_LEVEL_K";
+        case 0x0204a9: return "IS_FILL_LEVEL_C";
+        case 0x0204aa: return "IS_FILL_LEVEL_M";
+        case 0x0204ab: return "IS_FILL_LEVEL_Y";
+        case 0x0204ac: return "IS_FILL_LEVEL_LK";
+        case 0x0204ad: return "IS_FILL_LEVEL_FA";
+        case 0x0204ae: return "IS_FILL_LEVEL_DA";
+        case 0x0204af: return "IS_FILL_LEVEL_LTFA";
+        case 0x0204b0: return "IS_FAMILY_ID_K";
+        case 0x0204b1: return "IS_FAMILY_ID_C";
+        case 0x0204b2: return "IS_FAMILY_ID_M";
+        case 0x0204b3: return "IS_FAMILY_ID_Y";
+        case 0x0204b4: return "IS_FAMILY_ID_LK";
+        case 0x0204b5: return "IS_FAMILY_ID_FA";
+        case 0x0204b6: return "IS_FAMILY_ID_DA";
+        case 0x0204b7: return "IS_FAMILY_ID_LTFA";
+        case 0x0204b8: return "IS_MODEL_NUMBER_K";
+        case 0x0204b9: return "IS_MODEL_NUMBER_C";
+        case 0x0204ba: return "IS_MODEL_NUMBER_M";
+        case 0x0204bb: return "IS_MODEL_NUMBER_Y";
+        case 0x0204bc: return "IS_MODEL_NUMBER_LK";
+        case 0x0204bd: return "IS_MODEL_NUMBER_FA";
+        case 0x0204be: return "IS_MODEL_NUMBER_DA";
+        case 0x0204bf: return "IS_MODEL_NUMBER_LTFA";
+        case 0x0204c0: return "IS_SERIAL_NUM_K";
+        case 0x0204c1: return "IS_SERIAL_NUM_C";
+        case 0x0204c2: return "IS_SERIAL_NUM_M";
+        case 0x0204c3: return "IS_SERIAL_NUM_Y";
+        case 0x0204c4: return "IS_SERIAL_NUM_LK";
+        case 0x0204c5: return "IS_SERIAL_NUM_FA";
+        case 0x0204c6: return "IS_SERIAL_NUM_DA";
+        case 0x0204c7: return "IS_SERIAL_NUM_LTFA";
+        case 0x0204c8: return "IS_USER_ACK_K";
+        case 0x0204c9: return "IS_USER_ACK_C";
+        case 0x0204ca: return "IS_USER_ACK_M";
+        case 0x0204cb: return "IS_USER_ACK_Y";
+        case 0x0204cc: return "IS_USER_ACK_LK";
+        case 0x0204cd: return "IS_USER_ACK_FA";
+        case 0x0204ce: return "IS_USER_ACK_DA";
+        case 0x0204cf: return "IS_USER_ACK_LTFA";
+        case 0x0204d0: return "IS_ACUMEN_ID_A_K";
+        case 0x0204d1: return "IS_ACUMEN_ID_A_C";
+        case 0x0204d2: return "IS_ACUMEN_ID_A_M";
+        case 0x0204d3: return "IS_ACUMEN_ID_A_Y";
+        case 0x0204d4: return "IS_ACUMEN_ID_A_LK";
+        case 0x0204d5: return "IS_ACUMEN_ID_A_FA";
+        case 0x0204d6: return "IS_ACUMEN_ID_A_DA";
+        case 0x0204d7: return "IS_ACUMEN_ID_A_LTFA";
+        case 0x0204d8: return "IS_ACUMEN_ID_B_K";
+        case 0x0204d9: return "IS_ACUMEN_ID_B_C";
+        case 0x0204da: return "IS_ACUMEN_ID_B_M";
+        case 0x0204db: return "IS_ACUMEN_ID_B_Y";
+        case 0x0204dc: return "IS_ACUMEN_ID_B_LK";
+        case 0x0204dd: return "IS_ACUMEN_ID_B_FA";
+        case 0x0204de: return "IS_ACUMEN_ID_B_DA";
+        case 0x0204df: return "IS_ACUMEN_ID_B_LTFA";
+        case 0x0204e0: return "IS_ACUMEN_ID_LAST_GOOD_A_K";
+        case 0x0204e1: return "IS_ACUMEN_ID_LAST_GOOD_A_C";
+        case 0x0204e2: return "IS_ACUMEN_ID_LAST_GOOD_A_M";
+        case 0x0204e3: return "IS_ACUMEN_ID_LAST_GOOD_A_Y";
+        case 0x0204e4: return "IS_ACUMEN_ID_LAST_GOOD_A_LK";
+        case 0x0204e5: return "IS_ACUMEN_ID_LAST_GOOD_A_FA";
+        case 0x0204e6: return "IS_ACUMEN_ID_LAST_GOOD_A_DA";
+        case 0x0204e7: return "IS_ACUMEN_ID_LAST_GOOD_A_LTFA";
+        case 0x0204e8: return "IS_ACUMEN_ID_LAST_GOOD_B_K";
+        case 0x0204e9: return "IS_ACUMEN_ID_LAST_GOOD_B_C";
+        case 0x0204ea: return "IS_ACUMEN_ID_LAST_GOOD_B_M";
+        case 0x0204eb: return "IS_ACUMEN_ID_LAST_GOOD_B_Y";
+        case 0x0204ec: return "IS_ACUMEN_ID_LAST_GOOD_B_LK";
+        case 0x0204ed: return "IS_ACUMEN_ID_LAST_GOOD_B_FA";
+        case 0x0204ee: return "IS_ACUMEN_ID_LAST_GOOD_B_DA";
+        case 0x0204ef: return "IS_ACUMEN_ID_LAST_GOOD_B_LTFA";
+        case 0x0204f0: return "IS_MAJOR_ACCOUNTS_1";
+        case 0x0204f1: return "IS_MAJOR_ACCOUNTS_2";
+        case 0x0204f2: return "IS_A_PRIMES";
+        case 0x0204f3: return "IS_B_PRIMES";
+        case 0x0204f4: return "IS_APE_DISABLE";
+        case 0x0204f5: return "IS_APE_BOSS_ONLY";
+        case 0x0204f6: return "IS_APE_TIME_TRIGGER_A";
+        case 0x0204f7: return "IS_APE_TIME_TRIGGER_B";
+        case 0x0204f8: return "IS_APE_USAGE_TRIGGER_A";
+        case 0x0204f9: return "IS_APE_USAGE_TRIGGER_B";
+        case 0x0204fa: return "IS_APE_PREJOB_BYPASS_1";
+        case 0x0204fb: return "IS_APE_PREJOB_BYPASS_2";
+        case 0x0204fc: return "IS_APE_SUPPLY_AGE_SWITCH";
+        case 0x0204fd: return "IS_APE_C_SERVICE_ENABLE";
+        case 0x0204fe: return "IS_APE_TOTAL_PRIME_COUNT_LIMIT_A_AND_B";
+        case 0x0204ff: return "IS_APE_COUNT_A";
+        case 0x020500: return "IS_APE_COUNT_B";
+        case 0x020501: return "IS_APE_TOTAL_COUNT";
+        case 0x020502: return "IS_PVP_K";
+        case 0x020503: return "IS_PVP_C";
+        case 0x020504: return "IS_PVP_M";
+        case 0x020505: return "IS_PVP_Y";
+        case 0x020506: return "IS_PVP_LK";
+        case 0x020507: return "IS_PVP_FA";
+        case 0x020508: return "IS_PVP_DA";
+        case 0x020509: return "IS_PVP_LTFA";
+        case 0x02050a: return "IS_REGION_K";
+        case 0x02050b: return "IS_REGION_C";
+        case 0x02050c: return "IS_REGION_M";
+        case 0x02050d: return "IS_REGION_Y";
+        case 0x02050e: return "IS_REGION_LK";
+        case 0x02050f: return "IS_REGION_FA";
+        case 0x020510: return "IS_REGION_DA";
+        case 0x020511: return "IS_REGION_LTFA";
+        case 0x020512: return "IS_INTY_COS";
+        case 0x020513: return "IS_INTY_COS_GOAL";
+        case 0x020514: return "AI_MFG_GL_FILE";
+        case 0x020515: return "AI_MFG_GL_REJECT_HISTORY";
+        case 0x020516: return "AI_MFG_GL_STATE";
+        case 0x020517: return "AI_CACHE_K";
+        case 0x020518: return "AI_CACHE_C";
+        case 0x020519: return "AI_CACHE_M";
+        case 0x02051a: return "AI_CACHE_Y";
+        case 0x02051b: return "AI_CACHE_DIRTY";
+        case 0x02051c: return "AI_MFG_MONTHS_SINCE_1970_AT_MFG";
+        case 0x02051d: return "CNST_INK_SUBSCRIPTION_LEVEL";
+        case 0x02051e: return "CNST_USER_ACK_BITS_K";
+        case 0x02051f: return "CNST_USER_ACK_BITS_C";
+        case 0x020520: return "CNST_USER_ACK_BITS_M";
+        case 0x020521: return "CNST_USER_ACK_BITS_Y";
+        case 0x020522: return "CNST_USER_ACK_BITS_CMY";
+        case 0x020523: return "CNST_USER_ACK_BITS_FA";
+        case 0x020524: return "CNST_USER_ACK_BITS_DA";
+        case 0x020525: return "CNST_USER_ACK_BITS_LTFA";
+        case 0x020526: return "CNST_UNLOCK_GATHER_SCRAMBLE_SCHEME";
+        case 0x020527: return "CNST_UNLOCK_SUCCESSFUL_ATTEMPTS_REMAINING";
+        case 0x020528: return "CNST_UNLOCK_FAILED_ATTEMPTS_REMAINING";
+        case 0x020529: return "CNST_YETI_SUPPRESS_LOI";
+        case 0x02052a: return "IDS_HW_FAILURE";
+        case 0x02052b: return "IDS_FIRST_CHARGE_REQUIRED";
+        case 0x02052c: return "IDS_PUMP_DISABLE";
+        case 0x02052d: return "IDS_USER_MODIFIED_LOI_PERCENT";
+        case 0x02052e: return "IDS_USER_LOI_PERCENT_K";
+        case 0x02052f: return "IDS_USER_LOI_PERCENT_C";
+        case 0x020530: return "IDS_USER_LOI_PERCENT_M";
+        case 0x020531: return "IDS_USER_LOI_PERCENT_Y";
+        case 0x020532: return "IDS_USER_LOI_PERCENT_LK";
+        case 0x020533: return "IDS_ILG_STICKY_RESERVE_STATUS";
+        case 0x020534: return "IDS_SPITTOON_ILG_STATUS";
+        case 0x020535: return "IDS_SPITTOON_ILG";
+        case 0x020536: return "IDS_SPITTOON_ILG_LEFT";
+        case 0x020537: return "IDS_TOTAL_PRIME_INK_MG_K";
+        case 0x020538: return "IDS_TOTAL_PRIME_INK_MG_C";
+        case 0x020539: return "IDS_TOTAL_PRIME_INK_MG_M";
+        case 0x02053a: return "IDS_TOTAL_PRIME_INK_MG_Y";
+        case 0x02053b: return "IDS_TOTAL_PRIME_INK_MG_LK";
+        case 0x02053c: return "IDS_CTR_TOTAL_PRIME_INK_DG_K";
+        case 0x02053d: return "IDS_CTR_TOTAL_PRIME_INK_DG_C";
+        case 0x02053e: return "IDS_CTR_TOTAL_PRIME_INK_DG_M";
+        case 0x02053f: return "IDS_CTR_TOTAL_PRIME_INK_DG_Y";
+        case 0x020540: return "IDS_CTR_TOTAL_PRIME_INK_DG_LK";
+        case 0x020541: return "IDS_EXTENDED_ILG_K";
+        case 0x020542: return "IDS_EXTENDED_ILG_C";
+        case 0x020543: return "IDS_EXTENDED_ILG_M";
+        case 0x020544: return "IDS_EXTENDED_ILG_Y";
+        case 0x020545: return "IDS_EXTENDED_ILG_LK";
+        case 0x020546: return "IDS_FAKE_SECURE_BEHAVIOR";
+        case 0x020547: return "IDS_OVERRIDDEN_FIRM_LOG";
+        case 0x020548: return "IDS_ASSERT_MISSING_UDW";
+        case 0x020549: return "IDS_EMPTY_AT_INSERTION";
+        case 0x02054a: return "IDS_NOT_ENOUGH_AIR_WAREHOUSE_SPACE_TO_PRIME";
+        case 0x02054b: return "IDS_SENSOR_ONE_STATUS_K";
+        case 0x02054c: return "IDS_SENSOR_ONE_STATUS_C";
+        case 0x02054d: return "IDS_SENSOR_ONE_STATUS_M";
+        case 0x02054e: return "IDS_SENSOR_ONE_STATUS_Y";
+        case 0x02054f: return "IDS_SENSOR_ONE_STATUS_LK";
+        case 0x020550: return "IDS_TUBES_WET";
+        case 0x020551: return "IDS_ILG_USER_ACK_K";
+        case 0x020552: return "IDS_ILG_USER_ACK_C";
+        case 0x020553: return "IDS_ILG_USER_ACK_M";
+        case 0x020554: return "IDS_ILG_USER_ACK_Y";
+        case 0x020555: return "IDS_RECHARGE_LEVEL_REQUIRED";
+        case 0x020556: return "IDS_LEFT_SPITTOON_ILG_STATUS";
+        case 0x020557: return "IDS_ILG_K";
+        case 0x020558: return "IDS_ILG_C";
+        case 0x020559: return "IDS_ILG_M";
+        case 0x02055a: return "IDS_ILG_Y";
+        case 0x02055b: return "IDS_ILG_LK";
+        case 0x02055c: return "IDS_PRIME_SUPPLY_INSERTION_FLAG";
+        case 0x02055d: return "IDS_PHA_ILG_DUG_K";
+        case 0x02055e: return "IDS_PHA_ILG_DUG_C";
+        case 0x02055f: return "IDS_PHA_ILG_DUG_M";
+        case 0x020560: return "IDS_PHA_ILG_DUG_Y";
+        case 0x020561: return "IDS_SHAID_LOW_CTR_K";
+        case 0x020562: return "IDS_SHAID_LOW_CTR_C";
+        case 0x020563: return "IDS_SHAID_LOW_CTR_M";
+        case 0x020564: return "IDS_SHAID_LOW_CTR_Y";
+        case 0x020565: return "IDS_SHAID_HIGH_CTR_K";
+        case 0x020566: return "IDS_SHAID_HIGH_CTR_C";
+        case 0x020567: return "IDS_SHAID_HIGH_CTR_M";
+        case 0x020568: return "IDS_SHAID_HIGH_CTR_Y";
+        case 0x020569: return "IDS_LAST_PRIME_TIME_K";
+        case 0x02056a: return "IDS_LAST_PRIME_TIME_COLOR";
+        case 0x02056b: return "IDS_LAST_PRIME_TYPE_K";
+        case 0x02056c: return "IDS_LAST_PRIME_TYPE_COLOR";
+        case 0x02056d: return "IDS_LAST_AIR_MGMT_PRIME_TIME_K";
+        case 0x02056e: return "IDS_LAST_AIR_MGMT_PRIME_TIME_COLOR";
+        case 0x02056f: return "IDS_PRIME_CTR_STARTUP";
+        case 0x020570: return "IDS_PRIME_CTR_SUPPLY_CHANGE";
+        case 0x020571: return "IDS_PRIME_CTR_SUPPLY_CHANGE_K";
+        case 0x020572: return "IDS_PRIME_CTR_SUPPLY_CHANGE_COLOR";
+        case 0x020573: return "IDS_PRIME_CTR_LEVEL_0";
+        case 0x020574: return "IDS_PRIME_CTR_LEVEL_0_K";
+        case 0x020575: return "IDS_PRIME_CTR_LEVEL_0_COLOR";
+        case 0x020576: return "IDS_PRIME_CTR_LEVEL_1";
+        case 0x020577: return "IDS_PRIME_CTR_LEVEL_1_K";
+        case 0x020578: return "IDS_PRIME_CTR_LEVEL_1_COLOR";
+        case 0x020579: return "IDS_PRIME_CTR_GENERIC";
+        case 0x02057a: return "IDS_PRIME_CTR_GENERIC_K";
+        case 0x02057b: return "IDS_PRIME_CTR_GENERIC_COLOR";
+        case 0x02057c: return "IDS_PRIME_CTR_LEVEL_2_K";
+        case 0x02057d: return "IDS_PRIME_CTR_LEVEL_2_COLOR";
+        case 0x02057e: return "IDS_PRIME_CTR_EVNT_K_L0";
+        case 0x02057f: return "IDS_PRIME_CTR_EVNT_K_L1";
+        case 0x020580: return "IDS_PRIME_CTR_EVNT_K_L2";
+        case 0x020581: return "IDS_PRIME_CTR_EVNT_COLR_L0";
+        case 0x020582: return "IDS_PRIME_CTR_EVNT_COLR_L1";
+        case 0x020583: return "IDS_PRIME_CTR_EVNT_COLR_L2";
+        case 0x020584: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_0";
+        case 0x020585: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_1";
+        case 0x020586: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_2";
+        case 0x020587: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_3";
+        case 0x020588: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_0_K";
+        case 0x020589: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_1_K";
+        case 0x02058a: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_2_K";
+        case 0x02058b: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_3_K";
+        case 0x02058c: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_0_COLOR";
+        case 0x02058d: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_1_COLOR";
+        case 0x02058e: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_2_COLOR";
+        case 0x02058f: return "IDS_PRIME_CTR_PEN_RECOVERY_LEVEL_3_COLOR";
+        case 0x020590: return "IDS_PRIME_CTR_SHAID_RECOVERY";
+        case 0x020591: return "IDS_PRIME_CTR_SHAID_RECOVERY_K";
+        case 0x020592: return "IDS_PRIME_CTR_SHAID_RECOVERY_COLOR";
+        case 0x020593: return "IDS_PRIME_SMBW_FLAG";
+        case 0x020594: return "IDS_TIME_AT_LAST_UNCAP";
+        case 0x020595: return "IDS_TIME_AT_LAST_CAP";
+        case 0x020596: return "IDS_TIME_AT_LAST_POST_JOB";
+        case 0x020597: return "IDS_SHAID_CALIBRATION_COUNTER_K";
+        case 0x020598: return "IDS_SHAID_CALIBRATION_COUNTER_C";
+        case 0x020599: return "IDS_SHAID_CALIBRATION_COUNTER_M";
+        case 0x02059a: return "IDS_SHAID_CALIBRATION_COUNTER_Y";
+        case 0x02059b: return "IDS_PRIOR_STARTUP_FAILED_DUE_TO_SHAID";
+        case 0x02059c: return "IDS_PRIME_SERVICE_IN_PROGRESS";
+        case 0x02059d: return "IDS_PRIME_STEP_IN_PROGRESS";
+        case 0x02059e: return "IDS_PRIME_INT_COUNTER";
+        case 0x02059f: return "IDS_NEW_SUPPLY_FLAG";
+        case 0x0205a0: return "IDS_ABORTED_SCP_FLAG";
+        case 0x0205a1: return "IDS_PRIME_SHORT_SCP_FLAG";
+        case 0x0205a2: return "IDS_PRIME_LEVEL_2_FLAG_K";
+        case 0x0205a3: return "IDS_PRIME_LEVEL_2_FLAG_COLOR";
+        case 0x0205a4: return "IDS_ILG_K_HI";
+        case 0x0205a5: return "IDS_ILG_C_HI";
+        case 0x0205a6: return "IDS_ILG_M_HI";
+        case 0x0205a7: return "IDS_ILG_Y_HI";
+        case 0x0205a8: return "IDS_ILG_LK_HI";
+        case 0x0205a9: return "IDS_SET_POST_PRIME_VOL";
+        case 0x0205aa: return "IDS_LAST_PRIME_MASS_K";
+        case 0x0205ab: return "IDS_LAST_PRIME_MASS_C";
+        case 0x0205ac: return "IDS_LAST_PRIME_MASS_M";
+        case 0x0205ad: return "IDS_LAST_PRIME_MASS_Y";
+        case 0x0205ae: return "IDS_OASIS_BONGO_CYCLES";
+        case 0x0205af: return "IDS_SERVICE_STATION_INK_MG";
+        case 0x0205b0: return "IDS_PRIME_MASS_K";
+        case 0x0205b1: return "IDS_PRIME_MASS_C";
+        case 0x0205b2: return "IDS_PRIME_MASS_M";
+        case 0x0205b3: return "IDS_PRIME_MASS_Y";
+        case 0x0205b4: return "IDS_LAST_STARTUP_ALL_HOSTS";
+        case 0x0205b5: return "IDS_POST_STARTUP_SHAID_K";
+        case 0x0205b6: return "IDS_POST_STARTUP_SHAID_C";
+        case 0x0205b7: return "IDS_POST_STARTUP_SHAID_M";
+        case 0x0205b8: return "IDS_POST_STARTUP_SHAID_Y";
+        case 0x0205b9: return "IDS_STARTUP_DEBUG";
+        case 0x0205ba: return "IDS_SPIT_TO_SHAID_CTR_K";
+        case 0x0205bb: return "IDS_SPIT_TO_SHAID_CTR_C";
+        case 0x0205bc: return "IDS_SPIT_TO_SHAID_CTR_M";
+        case 0x0205bd: return "IDS_SPIT_TO_SHAID_CTR_Y";
+        case 0x0205be: return "IDS_POST_OOIO_ILG_MG_K";
+        case 0x0205bf: return "IDS_POST_OOIO_ILG_MG_C";
+        case 0x0205c0: return "IDS_POST_OOIO_ILG_MG_M";
+        case 0x0205c1: return "IDS_POST_OOIO_ILG_MG_Y";
+        case 0x0205c2: return "IDS_POST_OOIO_ILG_MG_LK";
+        case 0x0205c3: return "IDS_SUPPLY_INSERTION_OVERRIDE_K";
+        case 0x0205c4: return "IDS_SUPPLY_INSERTION_OVERRIDE_C";
+        case 0x0205c5: return "IDS_SUPPLY_INSERTION_OVERRIDE_M";
+        case 0x0205c6: return "IDS_SUPPLY_INSERTION_OVERRIDE_Y";
+        case 0x0205c7: return "IDS_SUPPLY_INSERTION_OVERRIDE_LK";
+        case 0x0205c8: return "IDS_PRIME_OVERRIDE_FLAG";
+        case 0x0205c9: return "IDS_PTOOI_LAST_CHECK_DATE_K";
+        case 0x0205ca: return "IDS_PTOOI_LAST_CHECK_DATE_C";
+        case 0x0205cb: return "IDS_PTOOI_LAST_CHECK_DATE_M";
+        case 0x0205cc: return "IDS_PTOOI_LAST_CHECK_DATE_Y";
+        case 0x0205cd: return "IDS_PTOOI_PREV_STATE_K";
+        case 0x0205ce: return "IDS_PTOOI_PREV_STATE_C";
+        case 0x0205cf: return "IDS_PTOOI_PREV_STATE_M";
+        case 0x0205d0: return "IDS_PTOOI_PREV_STATE_Y";
+        case 0x0205d1: return "IDS_WVTR_DEDUCTION_K";
+        case 0x0205d2: return "IDS_WVTR_DEDUCTION_C";
+        case 0x0205d3: return "IDS_WVTR_DEDUCTION_M";
+        case 0x0205d4: return "IDS_WVTR_DEDUCTION_Y";
+        case 0x0205d5: return "IDS_INK_USED_NON_PRIME_K_MG";
+        case 0x0205d6: return "IDS_INK_USED_NON_PRIME_C_MG";
+        case 0x0205d7: return "IDS_INK_USED_NON_PRIME_M_MG";
+        case 0x0205d8: return "IDS_INK_USED_NON_PRIME_Y_MG";
+        case 0x0205d9: return "IDS_SIC_FULL_NOT_ACK_FLAG";
+        case 0x0205da: return "IDS_SIC_FULL_ACK_COUNT";
+        case 0x0205db: return "IDS_OASIS_BIG_WINDOW_THRESHOLD_MS";
+        case 0x0205dc: return "IDS_PHA_EOL_PRIME_DONE";
+        case 0x0205dd: return "IDS_PHA_EARLY_SHAID_RECOVERY_DONE";
+        case 0x0205de: return "IDS_PRETEND_STARTUP";
+        case 0x0205df: return "IDS_INK_USED_NON_PRIME_LK_MG";
+        case 0x0205e0: return "IDS_ILG_USER_ACK_LK";
+        case 0x0205e1: return "IDS_PRIME_COUNT_K";
+        case 0x0205e2: return "IDS_PRIME_COUNT_COLOR";
+        case 0x0205e3: return "IDS_PTOOI_STATE_K";
+        case 0x0205e4: return "IDS_PTOOI_STATE_C";
+        case 0x0205e5: return "IDS_PTOOI_STATE_M";
+        case 0x0205e6: return "IDS_PTOOI_STATE_Y";
+        case 0x0205e7: return "IDS_PTOOI_LAST_RESULT_K";
+        case 0x0205e8: return "IDS_PTOOI_LAST_RESULT_C";
+        case 0x0205e9: return "IDS_PTOOI_LAST_RESULT_M";
+        case 0x0205ea: return "IDS_PTOOI_LAST_RESULT_Y";
+        case 0x0205eb: return "IDS_PTOOI_BASELINE_K";
+        case 0x0205ec: return "IDS_PTOOI_BASELINE_C";
+        case 0x0205ed: return "IDS_PTOOI_BASELINE_M";
+        case 0x0205ee: return "IDS_PTOOI_BASELINE_Y";
+        case 0x0205ef: return "IDS_PTOOI_LAST_TEMP_K";
+        case 0x0205f0: return "IDS_PTOOI_LAST_TEMP_C";
+        case 0x0205f1: return "IDS_PTOOI_LAST_TEMP_M";
+        case 0x0205f2: return "IDS_PTOOI_LAST_TEMP_Y";
+        case 0x0205f3: return "IDS_PTOOI_LAST_AMBIENT_TEMP_K";
+        case 0x0205f4: return "IDS_PTOOI_LAST_AMBIENT_TEMP_C";
+        case 0x0205f5: return "IDS_PTOOI_LAST_AMBIENT_TEMP_M";
+        case 0x0205f6: return "IDS_PTOOI_LAST_AMBIENT_TEMP_Y";
+        case 0x0205f7: return "IDS_PTOOI_MAX_TEMP_K";
+        case 0x0205f8: return "IDS_PTOOI_MAX_TEMP_C";
+        case 0x0205f9: return "IDS_PTOOI_MAX_TEMP_M";
+        case 0x0205fa: return "IDS_PTOOI_MAX_TEMP_Y";
+        case 0x0205fb: return "IDS_PTOOI_ADJUSTED_LDW_DROPS_PER_NOZZLE_K";
+        case 0x0205fc: return "IDS_PTOOI_ADJUSTED_LDW_DROPS_PER_NOZZLE_C";
+        case 0x0205fd: return "IDS_PTOOI_ADJUSTED_LDW_DROPS_PER_NOZZLE_M";
+        case 0x0205fe: return "IDS_PTOOI_ADJUSTED_LDW_DROPS_PER_NOZZLE_Y";
+        case 0x0205ff: return "IDS_PTOOI_ADJUSTED_HDW_DROPS_PER_NOZZLE_K";
+        case 0x020600: return "IDS_PTOOI_ADJUSTED_HDW_DROPS_PER_NOZZLE_C";
+        case 0x020601: return "IDS_PTOOI_ADJUSTED_HDW_DROPS_PER_NOZZLE_M";
+        case 0x020602: return "IDS_PTOOI_ADJUSTED_HDW_DROPS_PER_NOZZLE_Y";
+        case 0x020603: return "IDS_PTOOI_TPT_STATUS_K";
+        case 0x020604: return "IDS_PTOOI_LAST_SPIT_FIRING_FREQ_K";
+        case 0x020605: return "IDS_PTOOI_LAST_SPIT_FIRING_FREQ_C";
+        case 0x020606: return "IDS_PTOOI_LAST_SPIT_FIRING_FREQ_M";
+        case 0x020607: return "IDS_PTOOI_LAST_SPIT_FIRING_FREQ_Y";
+        case 0x020608: return "IDS_PTOOI_TOTAL_PRINTER_PTOOI_SPIT_EVENTS_COUNT_K";
+        case 0x020609: return "IDS_PTOOI_TOTAL_PRINTER_PTOOI_SPIT_EVENTS_COUNT_C";
+        case 0x02060a: return "IDS_PTOOI_TOTAL_PRINTER_PTOOI_SPIT_EVENTS_COUNT_M";
+        case 0x02060b: return "IDS_PTOOI_TOTAL_PRINTER_PTOOI_SPIT_EVENTS_COUNT_Y";
+        case 0x02060c: return "IDS_DISABLE_PTOOI";
+        case 0x02060d: return "IDS_PTOOI_DISABLED_FOR_SUPPLY_K";
+        case 0x02060e: return "IDS_PTOOI_DISABLED_FOR_SUPPLY_C";
+        case 0x02060f: return "IDS_PTOOI_DISABLED_FOR_SUPPLY_M";
+        case 0x020610: return "IDS_PTOOI_DISABLED_FOR_SUPPLY_Y";
+        case 0x020611: return "IDS_RESERVOIR_PERCENT_OOI_THRESHOLD_K";
+        case 0x020612: return "IDS_RESERVOIR_PERCENT_OOI_THRESHOLD_C";
+        case 0x020613: return "IDS_RESERVOIR_PERCENT_OOI_THRESHOLD_M";
+        case 0x020614: return "IDS_RESERVOIR_PERCENT_OOI_THRESHOLD_Y";
+        case 0x020615: return "IDS_RESERVOIR_PERCENT_FULL_THRESHOLD_K";
+        case 0x020616: return "IDS_RESERVOIR_PERCENT_FULL_THRESHOLD_C";
+        case 0x020617: return "IDS_RESERVOIR_PERCENT_FULL_THRESHOLD_M";
+        case 0x020618: return "IDS_RESERVOIR_PERCENT_FULL_THRESHOLD_Y";
+        case 0x020619: return "IDS_RESERVOIR_ILG_STATUS_K";
+        case 0x02061a: return "IDS_RESERVOIR_ILG_STATUS_C";
+        case 0x02061b: return "IDS_RESERVOIR_ILG_STATUS_M";
+        case 0x02061c: return "IDS_RESERVOIR_ILG_STATUS_Y";
+        case 0x02061d: return "IDS_SHAID_RESERVOIR_FAILURE_K";
+        case 0x02061e: return "IDS_SHAID_RESERVOIR_USER_ACK_K";
+        case 0x02061f: return "IDS_SHAID_RESERVOIR_FAILURE_C";
+        case 0x020620: return "IDS_SHAID_RESERVOIR_USER_ACK_C";
+        case 0x020621: return "IDS_SHAID_RESERVOIR_FAILURE_M";
+        case 0x020622: return "IDS_SHAID_RESERVOIR_USER_ACK_M";
+        case 0x020623: return "IDS_SHAID_RESERVOIR_FAILURE_Y";
+        case 0x020624: return "IDS_SHAID_RESERVOIR_USER_ACK_Y";
+        case 0x020625: return "IDS_RESERVOIR_ILG_DUG_K";
+        case 0x020626: return "IDS_RESERVOIR_ILG_DUG_C";
+        case 0x020627: return "IDS_RESERVOIR_ILG_DUG_M";
+        case 0x020628: return "IDS_RESERVOIR_ILG_DUG_Y";
+        case 0x020629: return "apsMaxCmyDropsSinceLastWipeDiv100000";
+        case 0x02062a: return "IDS_WVL_ADJUST_DATE";
+        case 0x02062c: return "XM_SERVICE_STATION_CAL_ENABLED";
+        case 0x02062d: return "XM_LOADED_MEDIA_SOURCE";
+        case 0x02062e: return "XM_ROLL_DESKEW_ENABLED";
+        case 0x02062f: return "XM_PAPER_ROLL_RADIUS";
+        case 0x020630: return "XM_PAPER_ROLL_UNITS_PER_INCH";
+        case 0x020631: return "XM_LOAD_SKEW_BUCKET0";
+        case 0x020632: return "XM_LOAD_SKEW_BUCKET1";
+        case 0x020633: return "XM_LOAD_SKEW_BUCKET2";
+        case 0x020634: return "XM_LOAD_SKEW_BUCKET3";
+        case 0x020635: return "XM_LOAD_SKEW_BUCKET5";
+        case 0x020636: return "XM_LOAD_SKEW_BUCKET6";
+        case 0x020637: return "XM_LOAD_SKEW_BUCKET7";
+        case 0x020638: return "XM_LOAD_SKEW_BUCKET8";
+        case 0x020639: return "XM_LOAD_SKEW_BUCKET9";
+        case 0x02063a: return "XM_LOAD_SKEW_BUCKET10";
+        case 0x02063b: return "XM_AUTODETECTED_MECH_X_AXIS_WIDTH_TYPE";
+        case 0x02063c: return "XM_CUT_COUNT";
+        case 0x02063d: return "XM_ROLL_LOAD_COUNT_8_5_IN_WIDTH";
+        case 0x02063e: return "XM_ROLL_LOAD_COUNT_11_IN_WIDTH";
+        case 0x02063f: return "XM_ROLL_LOAD_COUNT_18_IN_WIDTH";
+        case 0x020640: return "XM_ROLL_LOAD_COUNT_24_IN_WIDTH";
+        case 0x020641: return "XM_ROLL_LOAD_COUNT_36_IN_WIDTH";
+        case 0x020642: return "XM_ROLL_LOAD_COUNT_OTHER_WIDTH";
+        case 0x020643: return "XM_ROLL_LOAD_COUNT";
+        case 0x020644: return "XM_ROLL_LOAD_FAILED_COUNT";
+        case 0x020645: return "XM_HAND_FED_SHEETS_LOAD_COUNT";
+        case 0x020646: return "XM_HAND_FED_SHEETS_LOAD_FAILED_COUNT";
+        case 0x020647: return "XM_LTRAY_SHEETS_LOAD_COUNT_LETTER_SIZE";
+        case 0x020648: return "XM_LTRAY_SHEETS_LOAD_COUNT_LEGAL_SIZE";
+        case 0x020649: return "XM_LTRAY_SHEETS_LOAD_COUNT_LEDGER_SIZE";
+        case 0x02064a: return "XM_LTRAY_SHEETS_LOAD_COUNT_A4_SIZE";
+        case 0x02064b: return "XM_LTRAY_SHEETS_LOAD_COUNT_A3_SIZE";
+        case 0x02064c: return "XM_LTRAY_SHEETS_LOAD_COUNT_OTHER_SIZE";
+        case 0x02064d: return "XM_ROLL_CUT_COUNT_18_IN_WIDTH";
+        case 0x02064e: return "XM_ROLL_CUT_COUNT_24_IN_WIDTH";
+        case 0x02064f: return "XM_ROLL_CUT_COUNT_36_IN_WIDTH";
+        case 0x020650: return "XM_ROLL_CUT_COUNT_OTHER_WIDTH";
+        case 0x020651: return "XM_PRINT_JOB_COUNT";
+        case 0x020652: return "XM_PAPER_L_TRAY_PICK_RETRIES_COUNT";
+        case 0x020653: return "XM_PAPER_C_TRAY_PICK_RETRIES_COUNT";
+        case 0x020654: return "XM_CARRIAGE_SPIT_POS_ERROR_BLACK_MIN";
+        case 0x020655: return "XM_CARRIAGE_SPIT_POS_ERROR_BLACK_MAX";
+        case 0x020656: return "XM_CARRIAGE_SPIT_POS_ERROR_COLOR_MIN";
+        case 0x020657: return "XM_CARRIAGE_SPIT_POS_ERROR_COLOR_MAX";
+        case 0x020658: return "XM_CARRIAGE_SPIT_POS_ERROR_BLACK_LF_MIN";
+        case 0x020659: return "XM_CARRIAGE_SPIT_POS_ERROR_BLACK_LF_MAX";
+        case 0x02065a: return "XM_SPIT_BLACK_TOTAL";
+        case 0x02065b: return "XM_SPIT_COLOR_TOTAL";
+        case 0x02065c: return "XM_SPIT_BLACK_LEFT_TOTAL";
+        case 0x02065d: return "XM_SPIT_COUNT_POST_BOTH";
+        case 0x02065e: return "XM_SPIT_COUNT_POST_BLACK_LEFT_DEFCLR";
+        case 0x02065f: return "XM_SPIT_COUNT_POST_BLACK_LEFT";
+        case 0x020660: return "XM_SPIT_COUNT_PRE_COLOR";
+        case 0x020661: return "XM_SPIT_COUNT_PRE_BLACK";
+        case 0x020662: return "XM_SPIT_COUNT_PRE_BLACK_LEFT";
+        case 0x020663: return "XM_SPIT_COUNT_SWEEP_DELAY";
+        case 0x020664: return "XM_SPIT_COUNT_SWEEP_DELAY_LEFT";
+        case 0x020665: return "XM_SS_LENGTH_FACTORY";
+        case 0x020666: return "XM_SS_LENGTH_NOMINAL";
+        case 0x020667: return "XM_SS_LENGTH_DELTA_LAST";
+        case 0x020668: return "XM_SS_LENGTH_DELTA_MIN";
+        case 0x020669: return "XM_SS_LENGTH_DELTA_MAX";
+        case 0x02066a: return "XM_SS_LENGTH_TOLERANCE_FACTORY";
+        case 0x02066b: return "XM_SS_LENGTH_TOLERANCE_NOTIFY";
+        case 0x02066c: return "XM_SS_LENGTH_TOLERANCE_FAIL";
+        case 0x02066d: return "XM_MECH_IDS_STARTUP_BURPS_TO_SHAID_COUNTER";
+        case 0x02066e: return "XM_MANUAL_FEED_SMART_LOAD_ENABLED";
+        case 0x02066f: return "XM_NO_ARSS_TORQUE_SLEW_AVG_VALUE";
+        case 0x020670: return "XM_PAGES_PRINT_MECH_PL_TF_BEST_INCH_SQ";
+        case 0x020671: return "XM_PAGES_PRINT_MECH_PL_TF_NORM_INCH_SQ";
+        case 0x020672: return "XM_PAGES_PRINT_MECH_PL_TF_FAST_INCH_SQ";
+        case 0x020673: return "XM_PAGES_PRINT_MECH_OT_TF_BEST_INCH_SQ";
+        case 0x020674: return "XM_PAGES_PRINT_MECH_OT_TF_NORM_INCH_SQ";
+        case 0x020675: return "XM_PAGES_PRINT_MECH_OT_TF_FAST_INCH_SQ";
+        case 0x020676: return "XM_PAGES_PRINT_MECH_PL_MT_BEST_INCH_SQ";
+        case 0x020677: return "XM_PAGES_PRINT_MECH_PL_MT_NORM_INCH_SQ";
+        case 0x020678: return "XM_PAGES_PRINT_MECH_PL_MT_FAST_INCH_SQ";
+        case 0x020679: return "XM_PAGES_PRINT_MECH_OT_MT_BEST_INCH_SQ";
+        case 0x02067a: return "XM_PAGES_PRINT_MECH_OT_MT_NORM_INCH_SQ";
+        case 0x02067b: return "XM_PAGES_PRINT_MECH_OT_MT_FAST_INCH_SQ";
+        case 0x02067c: return "XM_MECH_LFP_MAIN_TRAY_CONFIG";
+        case 0x02067d: return "XM_MECH_SPINDLE_FORWARD_INERTIA_100";
+        case 0x02067e: return "XM_MECH_MASS1_FORWARDINERTIA_100";
+        case 0x02067f: return "XM_MECH_MASS2_FORWARDINERTIA_100";
+        case 0x020680: return "XM_MECH_BEAM_SPEED_SLOWDOWN_ENABLE";
+        case 0x020681: return "XM_CALIBRATED_REWIND_MOTOR";
+        case 0x020682: return "XM_CALIBRATED_PAPER_ROLL_PWM_SCALE_PERCENTAGE";
+        case 0x020683: return "XM_CALIBRATED_PAPER_ROLL_KE_SCALE_PERCENTAGE";
+        case 0x020684: return "PE_SVC_DIAGNOSTICS_ERROR_LOG_DATA";
+        case 0x020685: return "PE_SVC_DIAGNOSTICS_ERROR_LOG_FIRST";
+        case 0x020686: return "PE_SVC_DIAGNOSTICS_ERROR_LOG_COUNT";
+        case 0x020687: return "PE_SVC_DIAGNOSTICS_ERROR_LOG_NEXT_SEQUENCE_ID";
+        case 0x020688: return "PE_SVC_DIAGNOSTICS_LAST_ASSERT";
+        case 0x020689: return "PE_SVC_DIAGNOSTICS_DISABLED";
+        case 0x02068a: return "PE_SVC_DIAGNOSTICS_DISABLED_MFG";
+        case 0x02068b: return "PE_SVC_DIAGNOSTICS_NVM_BACKUP_RESTORED_COUNT";
+        case 0x02068c: return "PEN_AMBIENT_TEMP";
+        case 0x02068d: return "PEN_ILG_SLOT_0";
+        case 0x02068e: return "PEN_ILG_SLOT_1";
+        case 0x02068f: return "PEN_ILG_SLOT_2";
+        case 0x020690: return "PEN_ILG_SLOT_3";
+        case 0x020691: return "PEN_ILG_SLOT_4";
+        case 0x020692: return "PEN_ILG_SLOT_5";
+        case 0x020693: return "PEN_PEN_PRINT_DOT_COUNT_K_X1000";
+        case 0x020694: return "PEN_PEN_PRINT_DOT_COUNT_C_X1000";
+        case 0x020695: return "PEN_PEN_PRINT_DOT_COUNT_M_X1000";
+        case 0x020696: return "PEN_PEN_PRINT_DOT_COUNT_Y_X1000";
+        case 0x020697: return "PEN_PEN_PRINT_DOT_COUNT_LC_X1000";
+        case 0x020698: return "PEN_PEN_PRINT_DOT_COUNT_LM_X1000";
+        case 0x020699: return "PEN_PEN_TOTAL_DOT_COUNT_LK_X1000";
+        case 0x02069a: return "PEN_PEN_TOTAL_DOT_COUNT_LDW_C_X1000";
+        case 0x02069b: return "PEN_PEN_TOTAL_DOT_COUNT_LDW_M_X1000";
+        case 0x02069c: return "PEN_PEN_TOTAL_DOT_COUNT_LDW_Y_X1000";
+        case 0x02069d: return "PEN_PEN_TOTAL_DOT_COUNT_LDW_LK_X1000";
+        case 0x02069e: return "PEN_PUMP_MODULATED_DOT_COUNT_PEN_SLOT_0_X256";
+        case 0x02069f: return "PEN_PUMP_MODULATED_DOT_COUNT_PEN_SLOT_1_X256";
+        case 0x0206a0: return "PEN_PUMP_MODULATED_DOT_COUNT_PEN_SLOT_2_X256";
+        case 0x0206a1: return "PEN_PUMP_MODULATED_DOT_COUNT_PEN_SLOT_3_X256";
+        case 0x0206a2: return "PEN_PUMP_MODULATED_DOT_COUNT_PEN_SLOT_4_X256";
+        case 0x0206a3: return "PEN_PUMP_MODULATED_DOT_COUNT_PEN_SLOT_5_X256";
+        case 0x0206a4: return "PEN_GENUINE_HP_MOD_DOT_COUNT_PEN_SLOT_0_X256";
+        case 0x0206a5: return "PEN_GENUINE_HP_MOD_DOT_COUNT_PEN_SLOT_1_X256";
+        case 0x0206a6: return "PEN_GENUINE_HP_MOD_DOT_COUNT_PEN_SLOT_2_X256";
+        case 0x0206a7: return "PEN_GENUINE_HP_MOD_DOT_COUNT_PEN_SLOT_3_X256";
+        case 0x0206a8: return "PEN_GENUINE_HP_MOD_DOT_COUNT_PEN_SLOT_4_X256";
+        case 0x0206a9: return "PEN_GENUINE_HP_MOD_DOT_COUNT_PEN_SLOT_5_X256";
+        case 0x0206aa: return "PENS_ARE_AT_AMBIENT";
+        case 0x0206ab: return "PEN_LAST_THERMAL_TIME";
+        case 0x0206ac: return "NEW_PEN_INSERTED";
+        case 0x0206ad: return "PEN_MG_INK_FROM_THIS_PHA_PEN_SLOT_0";
+        case 0x0206ae: return "PEN_MG_INK_FROM_THIS_PHA_PEN_SLOT_1";
+        case 0x0206af: return "PEN_MG_INK_FROM_THIS_PHA_PEN_SLOT_2";
+        case 0x0206b0: return "PEN_MG_INK_FROM_THIS_PHA_PEN_SLOT_3";
+        case 0x0206b1: return "PEN_MG_INK_FROM_THIS_PHA_PEN_SLOT_4";
+        case 0x0206b2: return "PEN_MG_INK_FROM_THIS_PHA_PEN_SLOT_5";
+        case 0x0206b3: return "PEN_FIRST_PEN_INSTALLED";
+        case 0x0206ba: return "PEN_ILG_SLOT_0_HI";
+        case 0x0206bb: return "PEN_ILG_SLOT_1_HI";
+        case 0x0206bc: return "PEN_ILG_SLOT_2_HI";
+        case 0x0206bd: return "PEN_ILG_SLOT_3_HI";
+        case 0x0206be: return "PEN_ILG_SLOT_4_HI";
+        case 0x0206bf: return "PEN_ILG_SLOT_5_HI";
+        case 0x0206c0: return "PEN_CHANGE_COUNT";
+        case 0x0206c1: return "PEN_FAKE_SECURE_BEHAVIOR";
+        case 0x0206c2: return "PEN_OVERRIDDEN_FIRM_LOG";
+        case 0x0206c3: return "PEN_ASSERT_MISSING_UDW";
+        case 0x0206c4: return "PEN_LAST_ERROR_CODE";
+        case 0x0206c5: return "PEN_LAST_ERROR_CODE_1";
+        case 0x0206c6: return "PEN_LAST_ERROR_CODE_2";
+        case 0x0206c7: return "PEN_TREAT_PHA_AS_NEW_NEXT_TIME";
+        case 0x0206c8: return "PEN_STARTUP_BIT_MARKED_COUNT";
+        case 0x0206c9: return "PEN_AMBIENT_TEMP_TIMESTAMP";
+        case 0x0206ca: return "PEN_REPLACEMENT_PEN";
+        case 0x0206cb: return "PEN_PEN_PRINT_HP_DOT_COUNT_K_X1000";
+        case 0x0206cc: return "PEN_PEN_PRINT_HP_DOT_COUNT_C_X1000";
+        case 0x0206cd: return "PEN_PEN_PRINT_HP_DOT_COUNT_M_X1000";
+        case 0x0206ce: return "PEN_PEN_PRINT_HP_DOT_COUNT_Y_X1000";
+        case 0x0206cf: return "PEN_PEN_PRINT_HP_DOT_COUNT_LDW_C_X1000";
+        case 0x0206d0: return "PEN_PEN_PRINT_HP_DOT_COUNT_LDW_M_X1000";
+        case 0x0206d1: return "PEN_PEN_PRINT_HP_DOT_COUNT_LDW_Y_X1000";
+        case 0x0206d2: return "PEN_ID_K_HI";
+        case 0x0206d3: return "PEN_ID_K_LO";
+        case 0x0206d4: return "PEN_ID_C_HI";
+        case 0x0206d5: return "PEN_ID_C_LO";
+        case 0x0206d6: return "PEN_ID_FIFTH";
+        case 0x0206d7: return "PEN_ID_6";
+        case 0x0206d8: return "PEN_ID_7";
+        case 0x0206d9: return "PEN_ID_8";
+        case 0x0206da: return "PEN_ID_9";
+        case 0x0206db: return "PEN_ID_10";
+        case 0x0206dc: return "PEN_ID_11";
+        case 0x0206dd: return "PEN_ID_12";
+        case 0x0206de: return "PEN_ID_13";
+        case 0x0206df: return "PEN_ID_14";
+        case 0x0206e0: return "PEN_ID_15";
+        case 0x0206e1: return "PEN_ID_16";
+        case 0x0206e2: return "PEN_ID_17";
+        case 0x0206e3: return "PEN_TTOE_TEST_COMPLETE";
+        case 0x0206e4: return "PEN_TTOE_VOLTAGE_MV";
+        case 0x0206e5: return "PEN_TTOE_TEST_RESULT_K";
+        case 0x0206e6: return "PEN_TTOE_TEST_RESULT_HDW_NS";
+        case 0x0206e7: return "PEN_TTOE_TEST_RESULT_LDW_NS";
+        case 0x0206e8: return "PEN_OTOE_RESULT_NS_LDW_LT_K";
+        case 0x0206e9: return "PEN_OTOE_TEST_STATUS";
+        case 0x0206ea: return "PEN_OTOE_TEST_FAILURE";
+        case 0x0206eb: return "PEN_NEW_PHA_INSTALL_DATE";
+        case 0x0206ec: return "PEN_THERMAL_CAL_DONE";
+        case 0x0206ed: return "PEN_TSR_OFFSET_TSR_0";
+        case 0x0206ee: return "PEN_TSR_OFFSET_TSR_1";
+        case 0x0206ef: return "PEN_TSR_OFFSET_TSR_2";
+        case 0x0206f0: return "PEN_TSR_OFFSET_TSR_3";
+        case 0x0206f1: return "PEN_TSR_OFFSET_TSR_4";
+        case 0x0206f2: return "PEN_TSR_OFFSET_TSR_5";
+        case 0x0206f3: return "PEN_TSR_OFFSET_TSR_6";
+        case 0x0206f4: return "PEN_TSR_CURRENT_SOURCE";
+        case 0x0206f5: return "PEN_TSR_CURRENT_SOURCE_DIE_1";
+        case 0x0206f6: return "PEN_ALLOW_LDW_PWARM";
+        case 0x0206f7: return "PEN_TTOE_MAX_PULSE_NS_PEN_BALCK";
+        case 0x0206f8: return "PEN_TTOE_MIN_PULSE_NS_PEN_BALCK";
+        case 0x0206f9: return "PEN_TTOE_NUM_STEPS_PEN_BALCK";
+        case 0x0206fa: return "PEN_TTOE_MAX_PULSE_NS_PEN_COLOR";
+        case 0x0206fb: return "PEN_TTOE_MIN_PULSE_NS_PEN_COLOR";
+        case 0x0206fc: return "PEN_TTOE_NUM_STEPS_PEN_COLOR";
+        case 0x0206fd: return "PEN_TTOE_K_TRIES_REMAINING";
+        case 0x0206fe: return "PEN_TTOE_HDW_TRIES_REMAINING";
+        case 0x0206ff: return "PEN_TTOE_LDW_TRIES_REMAINING";
+        case 0x020700: return "PEN_TTOE_RESULT_K_TRIES_WHEN_SET";
+        case 0x020701: return "PEN_TTOE_RESULT_LDW_TRIES_WHEN_SET";
+        case 0x020702: return "PEN_TTOE_RESULT_HDW_TRIES_WHEN_SET";
+        case 0x020703: return "PEN_HIGH_ENERGY_SPIT_DONE";
+        case 0x020704: return "PEN_TTOE_AD_PEN_BLACK";
+        case 0x020705: return "PEN_TTOE_AD_PEN_COLOR";
+        case 0x020706: return "NO_PEN";
+        case 0x020707: return "PEN_PEN_TOTAL_DOT_COUNT_K_X1000";
+        case 0x020708: return "PEN_PEN_TOTAL_DOT_COUNT_C_X1000";
+        case 0x020709: return "PEN_PEN_TOTAL_DOT_COUNT_M_X1000";
+        case 0x02070a: return "PEN_PEN_TOTAL_DOT_COUNT_Y_X1000";
+        case 0x02070b: return "PEN_PEN_TOTAL_DOT_COUNT_LC_X1000";
+        case 0x02070c: return "PEN_PEN_TOTAL_DOT_COUNT_LM_X1000";
+        case 0x02070d: return "PEN_PEN_SPIT_DOT_COUNT_K_X1000";
+        case 0x02070e: return "PEN_PEN_SPIT_DOT_COUNT_C_X1000";
+        case 0x02070f: return "PEN_PEN_SPIT_DOT_COUNT_M_X1000";
+        case 0x020710: return "PEN_PEN_SPIT_DOT_COUNT_Y_X1000";
+        case 0x020711: return "PEN_PEN_SPIT_DOT_COUNT_LC_X1000";
+        case 0x020712: return "PEN_PEN_SPIT_DOT_COUNT_LM_X1000";
+        case 0x020713: return "PEN_TOTAL_INK_USAGE_ML";
+        case 0x020714: return "PEN_PEN_PRINT_DOT_COUNT_LDW_C_X1000";
+        case 0x020715: return "PEN_PEN_PRINT_DOT_COUNT_LDW_M_X1000";
+        case 0x020716: return "PEN_PEN_PRINT_DOT_COUNT_LDW_Y_X1000";
+        case 0x020717: return "PEN_PEN_PRINT_DOT_COUNT_LDW_LK_X1000";
+        case 0x020718: return "PEN_PEN_SPIT_DOT_COUNT_LDW_C_X1000";
+        case 0x020719: return "PEN_PEN_SPIT_DOT_COUNT_LDW_M_X1000";
+        case 0x02071a: return "PEN_PEN_SPIT_DOT_COUNT_LDW_Y_X1000";
+        case 0x02071b: return "PEN_PEN_SPIT_DOT_COUNT_LDW_LK_X1000";
+        case 0x02071c: return "PEN_PEN_PRINT_DOT_COUNT_LK_X1000";
+        case 0x02071d: return "PEN_PEN_SPIT_DOT_COUNT_LK_X1000";
+        case 0x02071e: return "PEN_TOTAL_HP_INK_USAGE_ML";
+        case 0x02071f: return "PEN_TOTAL_K_INK_USAGE_ML";
+        case 0x020720: return "PEN_TOTAL_CMYZ_INK_USAGE_ML";
+        case 0x020721: return "PEN_TOTAL_K_HP_INK_USAGE_ML";
+        case 0x020722: return "PEN_TOTAL_CMYZ_HP_INK_USAGE_ML";
+        case 0x020723: return "PEN_TOTAL_HP_INK_USAGE_UL";
+        case 0x020724: return "PEN_TOTAL_K_INK_USAGE_UL";
+        case 0x020725: return "PEN_TOTAL_CMYZ_INK_USAGE_UL";
+        case 0x020726: return "PEN_TOTAL_K_HP_INK_USAGE_UL";
+        case 0x020727: return "PEN_TOTAL_CMYZ_HP_INK_USAGE_UL";
+        case 0x020728: return "PEN_TOTAL_C_INK_USAGE_ML";
+        case 0x020729: return "PEN_TOTAL_M_INK_USAGE_ML";
+        case 0x02072a: return "PEN_TOTAL_Y_INK_USAGE_ML";
+        case 0x02072b: return "PEN_TOTAL_C_HP_INK_USAGE_ML";
+        case 0x02072c: return "PEN_TOTAL_M_HP_INK_USAGE_ML";
+        case 0x02072d: return "PEN_TOTAL_Y_HP_INK_USAGE_ML";
+        case 0x02072e: return "PEN_TOTAL_C_INK_USAGE_UL";
+        case 0x02072f: return "PEN_TOTAL_M_INK_USAGE_UL";
+        case 0x020730: return "PEN_TOTAL_Y_INK_USAGE_UL";
+        case 0x020731: return "PEN_TOTAL_C_HP_INK_USAGE_UL";
+        case 0x020732: return "PEN_TOTAL_M_HP_INK_USAGE_UL";
+        case 0x020733: return "PEN_TOTAL_Y_HP_INK_USAGE_UL";
+        case 0x020734: return "SHAID_MODE";
+        case 0x020735: return "DISABLE_IDS_STARTUP_ONCE";
+        case 0x020736: return "POLICY_ACF_COUNTERFEIT_COUNT";
+        case 0x020737: return "afax_images_sent";
+        case 0x020738: return "afax_images_received";
+        case 0x020739: return "XM_ANALOG_ENC_CAL_DIAGNOSTICS";
+        case 0x02073a: return "XM_ANALOG_ENC_CAL_SETTINGS";
+        case 0x02073b: return "XM_APE_A_COLOR_TIME_ESTIMATE";
+        case 0x02073c: return "XM_APE_A_K_TIME_ESTIMATE";
+        case 0x02073d: return "XM_APE_B_COLOR_TIME_ESTIMATE";
+        case 0x02073e: return "XM_APE_B_K_TIME_ESTIMATE";
+        case 0x02073f: return "XM_APE_BLACK_BOSS_PRIMES_COMPLETE";
+        case 0x020740: return "XM_APE_BLACK_FORCE_DEFAULT_USE";
+        case 0x020741: return "XM_APE_BLACK_LAST_SERVICE_EVENT";
+        case 0x020742: return "XM_APE_BLACK_PRIMES_COMPLETE";
+        case 0x020743: return "XM_APE_BLACK_PRIMES_REMAINING_A";
+        case 0x020744: return "XM_APE_BLACK_PRIMES_REMAINING_B";
+        case 0x020745: return "XM_APE_BLACK_TOTAL_COUNT";
+        case 0x020746: return "XM_APE_BLACK_TOTAL_PRIMES_EXECUTED";
+        case 0x020747: return "XM_APE_COLOR_BOSS_PRIMES_COMPLETE";
+        case 0x020748: return "XM_APE_COLOR_FORCE_DEFAULT_USE";
+        case 0x020749: return "XM_APE_COLOR_LAST_ACUMEN_USED";
+        case 0x02074a: return "XM_APE_COLOR_LAST_SERVICE_EVENT";
+        case 0x02074b: return "XM_APE_COLOR_PRIME_TIME_ELAPSED";
+        case 0x02074c: return "XM_APE_COLOR_PRIMES_COMPLETE";
+        case 0x02074d: return "XM_APE_COLOR_PRIMES_REMAINING_A";
+        case 0x02074e: return "XM_APE_COLOR_PRIMES_REMAINING_B";
+        case 0x02074f: return "XM_APE_COLOR_TOTAL_COUNT";
+        case 0x020750: return "XM_APE_COLOR_TOTAL_PRIMES_EXECUTED";
+        case 0x020751: return "XM_APE_K_PRIME_TIME_ELAPSED";
+        case 0x020752: return "XM_APE_PUMP_CHANNEL_BLACK_PRIME_STATE";
+        case 0x020753: return "XM_APE_PUMP_CHANNEL_COLOR_PRIME_STATE";
+        case 0x020754: return "XM_AUTO_LINEFEED_CAL_SCALE_NUMERATOR";
+        case 0x020755: return "XM_BASEMECH_AVE_PWM_AT_SS_HOME_SPEED";
+        case 0x020756: return "XM_BASEMECH_MAX_PWM_AT_SS_HOME_SPEED";
+        case 0x020757: return "XM_BOF_ERR";
+        case 0x020758: return "XM_BOFTE_OVERFEED_MAX_VALUE";
+        case 0x020759: return "XM_BUCK_DUPLEXER_INSTALLED";
+        case 0x02075a: return "XM_BUILD_PHASE_LP23";
+        case 0x02075b: return "XM_CAL_PAGE_NOT_ON_PLAIN_PAPER";
+        case 0x02075c: return "XM_CAP_MAX_PWM";
+        case 0x02075d: return "XM_CAPPING_FORCE";
+        case 0x02075e: return "XM_CAPPING_MAX_FORCE";
+        case 0x02075f: return "XM_CAPPING_MAX_FORCE_POSITION";
+        case 0x020760: return "XM_CARRIAGE_CALIBRATED";
+        case 0x020761: return "XM_CARRIAGE_DISENGAGE_MAX_TORQUE";
+        case 0x020762: return "XM_CARRIAGE_DISENGAGE_MAX_TORQUE_POS";
+        case 0x020763: return "XM_CARRIAGE_ENGAGE_ADAPTIVE_PP_PWM_LIMIT";
+        case 0x020764: return "XM_CARRIAGE_ENGAGE_ADAPTIVE_SS_PWM_LIMIT";
+        case 0x020765: return "XM_CARRIAGE_FAIL_ENGAGE_POS";
+        case 0x020768: return "XM_CARRIAGE_HOME_POS_HIGH_POWER";
+        case 0x020769: return "XM_CARRIAGE_HOME_POS_LOW_POWER";
+        case 0x02076a: return "XM_CARRIAGE_HOME_WIDTH_CHECK_RETRY_COUNT";
+        case 0x02076b: return "XM_CARRIAGE_LEFT_HOME_POS";
+        case 0x02076c: return "XM_CARRIAGE_LEFT_WALL_FIRST_TOUCH_POS";
+        case 0x02076d: return "XM_CARRIAGE_PRESENT_PENS_COUNT";
+        case 0x02076e: return "XM_CARRIAGE_PUSH_BACK_COUNT";
+        case 0x02076f: return "XM_CARRIAGE_QUIET_ENGAGE_FAILURE_COUNT";
+        case 0x020770: return "XM_CARRIAGE_QUIET_MOVE_RIGHT_HOME_MAX_SLEW_TORQUE";
+        case 0x020771: return "XM_CARRIAGE_QUIET_MOVE_RIGHT_HOME_MAX_TORQUE";
+        case 0x020772: return "XM_CARRIAGE_QUIET_MOVE_RIGHT_HOME_POS";
+        case 0x020773: return "XM_CARRIAGE_RIGHT_WALL_POS";
+        case 0x020774: return "XM_CARRIAGE_ROD_CAM_MOVE_PWM_AVG";
+        case 0x020775: return "XM_CARRIAGE_SLEW_COUNTER";
+        case 0x020776: return "XM_CARRIAGE_STALL_AT_SHIFTER_COUNT";
+        case 0x020777: return "XM_CARRIAGE_STALL_FAILED_TO_UNCAP_GPE";
+        case 0x020778: return "XM_CARRIAGE_STALL_FAILED_TO_WIPE_GPE";
+        case 0x020779: return "XM_CARRIAGE_TEMPERATURE_ESTIMATE_NEEDED";
+        case 0x02077a: return "XM_CARRIAGE_WIDTH_CHECK_AVG_SLEW_TORQUE";
+        case 0x02077c: return "XM_CARRIAGE_WIDTH_CHECK_POS";
+        case 0x02077d: return "XM_CHAMBER_TO_LUNG_PRESSURE_TOO_HIGH";
+        case 0x02077e: return "XM_COUNTER_CARRIAGE_ENGAGE_SS_RETRY";
+        case 0x02077f: return "XM_COUNTER_CARRIAGE_ENGAGE_TOTAL";
+        case 0x020780: return "XM_COUNTER_CARRIAGE_FALSE_HOME";
+        case 0x020781: return "XM_COUNTER_CARRIAGE_PUMP_ENGAGE_RETRY";
+        case 0x020782: return "XM_COUNTER_CARRIAGE_PUMP_ENGAGE_RETRY_COLOR";
+        case 0x020783: return "XM_COUNTER_PEN_PUMP_ENGAGE_FAILURE_TUBE_EVAC";
+        case 0x020784: return "XM_CUTTER_ENABLED";
+        case 0x020785: return "XM_DEFAULT_TRAY_SELECTION";
+        case 0x020786: return "XM_DISABLE_ADOT";
+        case 0x020787: return "XM_DISABLE_PAGE_LENGTH_MISMATCH";
+        case 0x020788: return "XM_DPU_CARRIAGE_WIDTH_CHECK_POS";
+        case 0x020789: return "XM_DPU_WIDTH_CHECK_MAX_POSITION";
+        case 0x02078a: return "XM_DRAFT_SEPTE_OVERFEED_0_CTR";
+        case 0x02078b: return "XM_DRAFT_SEPTE_OVERFEED_1_CTR";
+        case 0x02078c: return "XM_DRAFT_SEPTE_OVERFEED_2_CTR";
+        case 0x02078d: return "XM_DRAFT_SEPTE_OVERFEED_3_CTR";
+        case 0x02078e: return "XM_DRAFT_SEPTE_OVERFEED_MAX_CTR";
+        case 0x02078f: return "XM_DRAFT_SEPTE_PWM_MAX_CTR";
+        case 0x020790: return "XM_DRAFT_SEPTE_ZONE_PAGE_CTR";
+        case 0x020791: return "XM_DRY_WIPE_COUNT";
+        case 0x020792: return "XM_DUPLEX_MODE";
+        case 0x020793: return "XM_EN_SERVICE_COUNTER_POST_STARTUP_COLOR_LEVEL_2";
+        case 0x020794: return "XM_ENABLE_ADOT_STALL_DETECTION";
+        case 0x020795: return "XM_ENABLE_MECH_SCAN_AXIS_WIPE_MODE";
+        case 0x020796: return "XM_END_OF_JOB_WIDTH_CHECK_MAX_POSITION";
+        case 0x020797: return "XM_ENTRAINED_SPITS_ENABLE";
+        case 0x020798: return "XM_FAILURE_TO_EJECT_MEDIA_GPE_CTR";
+        case 0x020799: return "XM_FAILURE_TO_LIFT_PICK_ARM_GPE_CTR";
+        case 0x02079a: return "XM_FAILURE_TO_LOCK_WIPER_UP_GPE_CTR";
+        case 0x02079b: return "XM_FAST_TUBE_SLEW_COUNTER";
+        case 0x02079c: return "XM_FM_BKT_IDLE_1";
+        case 0x02079d: return "XM_FM_BKT_IDLE_10";
+        case 0x02079e: return "XM_FM_BKT_IDLE_2";
+        case 0x02079f: return "XM_FM_BKT_IDLE_3";
+        case 0x0207a0: return "XM_FM_BKT_IDLE_4";
+        case 0x0207a1: return "XM_FM_BKT_IDLE_5";
+        case 0x0207a2: return "XM_FM_BKT_IDLE_6";
+        case 0x0207a3: return "XM_FM_BKT_IDLE_7";
+        case 0x0207a4: return "XM_FM_BKT_IDLE_8";
+        case 0x0207a5: return "XM_FM_BKT_IDLE_9";
+        case 0x0207a6: return "XM_FM_CAL_PAGE_SPOT_BOF_DETECT_SUCCESS";
+        case 0x0207a7: return "XM_FM_CARRIAGE_THERMAL_PROTECTION_PAGE_COUNT";
+        case 0x0207a8: return "XM_FM_CRG_DIST_TRAVELED";
+        case 0x0207a9: return "XM_FM_CRG_DIST_TRAVELED_ROLLOVER";
+        case 0x0207aa: return "XM_FM_ERROR_INFO_0";
+        case 0x0207ab: return "XM_FM_ERROR_INFO_1";
+        case 0x0207ac: return "XM_FM_ERROR_INFO_2";
+        case 0x0207ad: return "XM_FM_ERROR_INFO_3";
+        case 0x0207ae: return "XM_FM_ERROR_INFO_4";
+        case 0x0207af: return "XM_FM_FINISHER_WIDE_FORMAT_ENABLED";
+        case 0x0207b0: return "XM_FM_FLOW_DOWNLOAD_ENABLED";
+        case 0x0207b1: return "XM_FM_IN_QUIET_MODE";
+        case 0x0207b2: return "XM_FM_LAST_STALL_CODE";
+        case 0x0207b3: return "XM_FM_MFG_OBJ_1";
+        case 0x0207b4: return "XM_FM_MFG_OBJ_2";
+        case 0x0207b5: return "XM_FM_MFG_OBJ_3";
+        case 0x0207b6: return "XM_FM_MFG_OBJ_4";
+        case 0x0207b7: return "XM_FM_SOS_PRIME_TIME_ELAPSED";
+        case 0x0207b8: return "XM_FM_SS_BINDING_FRONT_FAILURE_COUNT";
+        case 0x0207b9: return "XM_FM_SS_BINDING_REAR_FAILURE_COUNT";
+        case 0x0207ba: return "XM_FM_SS_CAP_TO_FWD_HOME_DIST";
+        case 0x0207bb: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST";
+        case 0x0207bc: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_0";
+        case 0x0207bd: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_1";
+        case 0x0207be: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_2";
+        case 0x0207bf: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_3";
+        case 0x0207c0: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_4";
+        case 0x0207c1: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_5";
+        case 0x0207c2: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_6";
+        case 0x0207c3: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_7";
+        case 0x0207c4: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_8";
+        case 0x0207c5: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_9";
+        case 0x0207c6: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_AVG";
+        case 0x0207c7: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_COUNT";
+        case 0x0207c8: return "XM_FM_SS_SHUTTLE_TRAVEL_DIST_INDEX";
+        case 0x0207c9: return "XM_FM_TIMER_98";
+        case 0x0207ca: return "XM_FM_TRACE";
+        case 0x0207cb: return "XM_FM_TRACE_ENABLE";
+        case 0x0207cc: return "XM_FM_TRACE_LEVEL";
+        case 0x0207cd: return "XM_FM_TRACE_PERSISTENT";
+        case 0x0207ce: return "XM_FM_WVTR_TIME_ELAPSED";
+        case 0x0207cf: return "XM_GENERAL_PRINTER_ERROR_LAST_CODE";
+        case 0x0207d0: return "XM_GENERAL_PRINTER_ERROR_LAST_CODE_PREV";
+        case 0x0207d1: return "XM_GENERAL_PRINTER_ERROR_LAST_CODE_PREV_PREV";
+        case 0x0207d2: return "XM_HOMING_FAILURE_GPE_CTR";
+        case 0x0207d3: return "XM_IDS_INK_USED_APE_C_MG";
+        case 0x0207d4: return "XM_IDS_INK_USED_APE_K_MG";
+        case 0x0207d5: return "XM_IDS_INK_USED_APE_M_MG";
+        case 0x0207d6: return "XM_IDS_INK_USED_APE_Y_MG";
+        case 0x0207d7: return "XM_IDS_PRIME_STARTUP_VOL_REQUIRED_C";
+        case 0x0207d8: return "XM_IDS_PRIME_STARTUP_VOL_REQUIRED_K";
+        case 0x0207d9: return "XM_IN_JOB_CAP_TIMEOUT_1";
+        case 0x0207da: return "XM_IN_JOB_CAP_TIMEOUT_2";
+        case 0x0207db: return "XM_LAST_CAP_POS";
+        case 0x0207dc: return "XM_LAST_CAP_POS_0K";
+        case 0x0207dd: return "XM_LAST_CARRIAGE_ENGAGE_POS";
+        case 0x0207de: return "XM_LAST_PRIME_LEVEL_BLACK";
+        case 0x0207df: return "XM_LAST_PRIME_LEVEL_COLOR";
+        case 0x0207e0: return "XM_LOAD_ALGO_OVERRIDE";
+        case 0x0207e1: return "XM_LOCK_TRAY";
+        case 0x0207e2: return "XM_MECH_4X6_SHIFTED_TOO_LONG";
+        case 0x0207e3: return "XM_MECH_4X6_SHIFTED_TOO_SHORT";
+        case 0x0207e4: return "XM_MECH_5X7_SHIFTED_TOO_LONG";
+        case 0x0207e5: return "XM_MECH_5X7_SHIFTED_TOO_SHORT";
+        case 0x0207e6: return "XM_MECH_ADAPTIVE_RAMP_FAILURE_POSITION";
+        case 0x0207e7: return "XM_MECH_ADAPTIVE_RAMP_POSITION";
+        case 0x0207e8: return "XM_MECH_ADAPTIVE_RAMP_POSITION_PWM_USED";
+        case 0x0207e9: return "XM_MECH_AUTO_DIRTY_POWER_UP_COUNTER";
+        case 0x0207ea: return "XM_MECH_AUTO_DIRTY_POWER_UP_FAILURE_COUNTER";
+        case 0x0207eb: return "XM_MECH_AUTO_DIRTY_POWER_UP_FLAG";
+        case 0x0207ec: return "XM_MECH_BOF_LF_SCALE";
+        case 0x0207ed: return "XM_MECH_CAP_SERVICE_COUNT";
+        case 0x0207ee: return "XM_MECH_CARRIAGE_STALL_COUNT";
+        case 0x0207ef: return "XM_MECH_CARRIAGE_UNLOCK_RETRY_ENABLED";
+        case 0x0207f0: return "XM_MECH_CARRIAGE_UNLOCK_RETRY1_COUNT";
+        case 0x0207f1: return "XM_MECH_CARRIAGE_UNLOCK_RETRY2_COUNT";
+        case 0x0207f2: return "XM_MECH_CHECK_FOR_TRAY_LOCK";
+        case 0x0207f3: return "XM_MECH_CISS_MAX_PRIMES";
+        case 0x0207f4: return "XM_MECH_CISS_STARTUP_SERVICE_DONE";
+        case 0x0207f5: return "XM_MECH_COLOR_SPIT_POS_USAGE_TRACKING";
+        case 0x0207f6: return "XM_MECH_COUNT_CARRIAGE_HOME";
+        case 0x0207f7: return "XM_MECH_COUNT_CARRIAGE_TO_LEFT_WALL";
+        case 0x0207f8: return "XM_MECH_COUNT_SIDE2_NO_PICK";
+        case 0x0207f9: return "XM_MECH_CRG_CAL_PAGE_COUNT";
+        case 0x0207fa: return "XM_MECH_DEBUG_CONFIG";
+        case 0x0207fb: return "XM_MECH_DETENT_LOGIC_NEEDED";
+        case 0x0207fc: return "XM_MECH_DIRTY_FLAG";
+        case 0x0207fd: return "XM_MECH_DOOR_OPEN_DURING_REBOOT";
+        case 0x0207fe: return "XM_MECH_EXTENDED_SNEAK_ENABLED";
+        case 0x0207ff: return "XM_MECH_FF_CAP_CNT_RETRY1";
+        case 0x020800: return "XM_MECH_FF_CAP_CNT_RETRY2";
+        case 0x020801: return "XM_MECH_FIRST_PAGE_STALL_RETRY_ENABLED";
+        case 0x020802: return "XM_MECH_FIRST_PASS_DPU_FAILURE_CTR";
+        case 0x020803: return "XM_MECH_FSD_TO_ZIM_LONG_COUNTER";
+        case 0x020804: return "XM_MECH_IDS_STARTUP_RETRY_BLACK_COUNTER";
+        case 0x020805: return "XM_MECH_IDS_STARTUP_RETRY_COLOR_COUNTER";
+        case 0x020806: return "XM_MECH_IS_IN_OOBE";
+        case 0x020807: return "XM_MECH_LAST_CAL_PEN_MASS_G";
+        case 0x020808: return "XM_MECH_LAST_SHIFT_FAILURE_PAGE_COUNT";
+        case 0x020809: return "XM_MECH_LONG_UNCAP_COUNT";
+        case 0x02080a: return "XM_MECH_MAINTENANCE_PAGE_COUNT";
+        case 0x02080b: return "XM_MECH_MISR_PREV_UNCAP_TIMESTAMP";
+        case 0x02080c: return "XM_MECH_MISR_PROFILES";
+        case 0x02080d: return "XM_MECH_MOD";
+        case 0x02080e: return "XM_MECH_NO_OUTPUT_CLUTCH_INSTALLED";
+        case 0x02080f: return "XM_MECH_NUM_PICK_RETRIES_UNI_A_TRAY_COUNTER";
+        case 0x020810: return "XM_MECH_NUM_PICK_RETRIES_UNI_B_TRAY_COUNTER";
+        case 0x020811: return "XM_MECH_NUM_PICK_RETRIES_UNI_C_TRAY_COUNTER";
+        case 0x020812: return "XM_MECH_OUT_OF_PAPER_COUNT";
+        case 0x020813: return "XM_MECH_PAPER_JAM_COUNT";
+        case 0x020814: return "XM_MECH_PAPER_STALL_COUNT";
+        case 0x020815: return "XM_MECH_PARTIAL_PICK_COUNTER";
+        case 0x020816: return "XM_MECH_PEN_DOT_COUNT_C_AT_MISR_REQUEST";
+        case 0x020817: return "XM_MECH_PEN_DOT_COUNT_K_AT_MISR_REQUEST";
+        case 0x020818: return "XM_MECH_PEN_DOT_COUNT_M_AT_MISR_REQUEST";
+        case 0x020819: return "XM_MECH_PEN_DOT_COUNT_Y_AT_MISR_REQUEST";
+        case 0x02081a: return "XM_MECH_PEN_LATCH_OPEN_STALL_COUNT";
+        case 0x02081b: return "XM_MECH_PICK_DRIVE_RATIO_MODIFIED_ENABLED";
+        case 0x02081c: return "XM_MECH_PLUNGE_THRU_COUNTER_2";
+        case 0x02081d: return "XM_MECH_POPPING_PINCH_ENABLED";
+        case 0x02081e: return "XM_MECH_PREV_JOB_TIMESTAMP";
+        case 0x02081f: return "XM_MECH_PRIME_NUM_LOOPS_CMY";
+        case 0x020820: return "XM_MECH_PRIME_NUM_LOOPS_K";
+        case 0x020821: return "XM_MECH_PUMP_ENGAGE_RETRY_COUNT";
+        case 0x020822: return "XM_MECH_PUNTED_SWEEP_COUNT";
+        case 0x020823: return "XM_MECH_QUANTUM_SAS_TEST";
+        case 0x020824: return "XM_MECH_RUNNING_PAGE_COUNT";
+        case 0x020825: return "XM_MECH_SENSOR_FIELD_CAL_CYCLE";
+        case 0x020826: return "XM_MECH_SEPTE_PUNTED_SWEEP_COUNT";
+        case 0x020827: return "XM_MECH_SERVICE_RATIO_COUNTER_0";
+        case 0x020828: return "XM_MECH_SERVICE_STALL_COUNT";
+        case 0x020829: return "XM_MECH_SPRING_OOPS_ENABLED";
+        case 0x02082a: return "XM_MECH_STACK_HEIGHT_MAX_TORQUE_FORCE_VALUE";
+        case 0x02082b: return "XM_MECH_STACK_HEIGHT_MIN_MOTION_AFTER_REAR_HOME";
+        case 0x02082c: return "XM_MECH_STARWHEEL_LOWER_COUNTER";
+        case 0x02082d: return "XM_MECH_STARWHEEL_RAISE_COUNTER";
+        case 0x02082e: return "XM_MECH_TAILGATE_PARTIAL_PICK_COUNTER";
+        case 0x02082f: return "XM_MECH_TOP_OOPS_TRIG_POS";
+        case 0x020830: return "XM_MECH_TOTAL_COUNT_2ND_PICK_OK";
+        case 0x020831: return "XM_MECH_TOTAL_COUNT_3RD_PICK_OK";
+        case 0x020832: return "XM_MECH_TOTAL_COUNT_ASIZE_JOB_MEASURED_PAGES";
+        case 0x020833: return "XM_MECH_TOTAL_COUNT_ASIZE_JOB_MULTIPICKS";
+        case 0x020834: return "XM_MECH_TOTAL_COUNT_ASIZE_JOB_WHIFFS";
+        case 0x020835: return "XM_MECH_TOTAL_COUNT_CAP_FAILURE";
+        case 0x020836: return "XM_MECH_TOTAL_COUNT_CARDSIZE_JOB_MEASURED_PAGES";
+        case 0x020837: return "XM_MECH_TOTAL_COUNT_CARDSIZE_JOB_MULTIPICKS";
+        case 0x020838: return "XM_MECH_TOTAL_COUNT_CARDSIZE_JOB_WHIFFS";
+        case 0x020839: return "XM_MECH_TOTAL_COUNT_CARRIAGE_HOME";
+        case 0x02083a: return "XM_MECH_TOTAL_COUNT_DESKEW_STALL";
+        case 0x02083b: return "XM_MECH_TOTAL_COUNT_ENV_2ND_PICK";
+        case 0x02083c: return "XM_MECH_TOTAL_COUNT_ENV_3RD_PICK";
+        case 0x02083d: return "XM_MECH_TOTAL_COUNT_GATHERING_STALL";
+        case 0x02083e: return "XM_MECH_TOTAL_COUNT_GATHERING_TORQUE_GTE_10_LT_12";
+        case 0x02083f: return "XM_MECH_TOTAL_COUNT_GATHERING_TORQUE_GTE_12_LT_14";
+        case 0x020840: return "XM_MECH_TOTAL_COUNT_GATHERING_TORQUE_GTE_14_LT_16";
+        case 0x020841: return "XM_MECH_TOTAL_COUNT_GATHERING_TORQUE_GTE_16_LT_18";
+        case 0x020842: return "XM_MECH_TOTAL_COUNT_GATHERING_TORQUE_GTE_18_LT_20";
+        case 0x020843: return "XM_MECH_TOTAL_COUNT_GATHERING_TORQUE_GTE_20";
+        case 0x020844: return "XM_MECH_TOTAL_COUNT_GATHERING_TORQUE_LT_10";
+        case 0x020845: return "XM_MECH_TOTAL_COUNT_GLOSSY_2ND_PICK";
+        case 0x020846: return "XM_MECH_TOTAL_COUNT_GLOSSY_2ND_PICK_FAILURE";
+        case 0x020847: return "XM_MECH_TOTAL_COUNT_GLOSSY_3RD_PICK_FAILURE";
+        case 0x020848: return "XM_MECH_TOTAL_COUNT_LEFT_BLOT";
+        case 0x020849: return "XM_MECH_TOTAL_COUNT_PICK_ENGAGE_POS_MAXT_HIGH";
+        case 0x02084a: return "XM_MECH_TOTAL_COUNT_PICK_FAILURE";
+        case 0x02084b: return "XM_MECH_TOTAL_COUNT_PLAIN_2ND_PICK";
+        case 0x02084c: return "XM_MECH_TOTAL_COUNT_PLAIN_2ND_PICK_FAILURE";
+        case 0x02084d: return "XM_MECH_TOTAL_COUNT_PLAIN_3RD_PICK_FAILURE";
+        case 0x02084e: return "XM_MECH_TOTAL_COUNT_PLAIN_SPEEDMECH_2ND_PICK";
+        case 0x02084f: return "XM_MECH_TOTAL_COUNT_PLUNGE_THRU_2ND_PICK";
+        case 0x020850: return "XM_MECH_TOTAL_COUNT_PLUNGE_THRU_2ND_PICK_2";
+        case 0x020851: return "XM_MECH_TOTAL_COUNT_PLUNGE_THRU_3RD_PICK";
+        case 0x020852: return "XM_MECH_TOTAL_COUNT_PLUNGE_THRU_3RD_PICK_2";
+        case 0x020853: return "XM_MECH_TOTAL_COUNT_POST_OOPS_LOAD_STALL";
+        case 0x020854: return "XM_MECH_TOTAL_COUNT_PRE_OOPS_LOAD_STALL";
+        case 0x020855: return "XM_MECH_TOTAL_COUNT_RECOVERY_FAILURE_DPU";
+        case 0x020856: return "XM_MECH_TOTAL_COUNT_RECOVERY_FAILURE_ENGAGE";
+        case 0x020857: return "XM_MECH_TOTAL_COUNT_RIGHT_BLOT";
+        case 0x020858: return "XM_MECH_TOTAL_COUNT_SHIFT_ATTEMPT_COMPLETED";
+        case 0x020859: return "XM_MECH_TOTAL_COUNT_SHIFT_ATTEMPT_FAILURE";
+        case 0x02085a: return "XM_MECH_TOTAL_COUNT_SHIFT_ENGAGE_FAILURE";
+        case 0x02085b: return "XM_MECH_TOTAL_COUNT_SHIFT_RECOVERY_DPU";
+        case 0x02085c: return "XM_MECH_TOTAL_COUNT_SHIFT_RECOVERY_ENGAGE";
+        case 0x02085d: return "XM_MECH_TOTAL_COUNT_SHIFT_RETRY";
+        case 0x02085e: return "XM_MECH_TOTAL_COUNT_SPOT_EDGE_FAILURE";
+        case 0x02085f: return "XM_MECH_TOTAL_COUNT_SPOT_TOF_FAILURE";
+        case 0x020860: return "XM_MECH_TOTAL_COUNT_TURNROLLER_DESKEW_STALL";
+        case 0x020862: return "XM_MECH_TOTAL_COUNT_UNEXPECTED_PAPER_UNCLEARABLE";
+        case 0x020863: return "XM_MECH_TOTAL_COUNT_UNTRIGGERED_ADAPTIVE_DESKEW";
+        case 0x020864: return "XM_MECH_TRAILING_PICK_COUNTER";
+        case 0x020865: return "XM_MECH_TRAY_SETTLING_TIME";
+        case 0x020866: return "XM_MECH_UNEXPECTED_PAPER_COUNT";
+        case 0x020867: return "XM_MECH_UNEXPECTED_UNCAP_COUNTER";
+        case 0x020868: return "XM_MEDIA_MANUAL_OFFSET";
+        case 0x020869: return "XM_MEDIA_SENSE_GLOSS_RATIO";
+        case 0x02086a: return "XM_MISR_SERVICE_SIGNAL_COUNT";
+        case 0x02086b: return "XM_MISR_SERVICE_SUPPLEMENT_COUNT";
+        case 0x02086c: return "XM_MISR_SERVICE_SUPPLEMENTAL_REQUEST";
+        case 0x02086d: return "XM_MISR_SERVICE_SUPPLEMENTAL_SPIT_AMOUNT";
+        case 0x02086e: return "XM_MISR_SERVICE_TOTAL_COUNT";
+        case 0x02086f: return "XM_NEW_WIDTH_CHECK_FAILURE_COUNTER";
+        case 0x020870: return "XM_NO_PAPER";
+        case 0x020871: return "XM_NORMAL_SEPTE_OVERFEED_0_CTR";
+        case 0x020872: return "XM_NORMAL_SEPTE_OVERFEED_1_CTR";
+        case 0x020873: return "XM_NORMAL_SEPTE_OVERFEED_2_CTR";
+        case 0x020874: return "XM_NORMAL_SEPTE_OVERFEED_3_CTR";
+        case 0x020875: return "XM_NORMAL_SEPTE_OVERFEED_MAX_CTR";
+        case 0x020876: return "XM_NORMAL_SEPTE_PWM_MAX_CTR";
+        case 0x020877: return "XM_NORMAL_SEPTE_ZONE_PAGE_CTR";
+        case 0x020879: return "XM_OOPS_MIDJOB_FAILURE_TO_EJECT_MEDIA_GPE_CTR";
+        case 0x02087a: return "XM_OOPS_TO_BOFTE_DIST";
+        case 0x02087b: return "XM_OOPS_TO_BOFTE_NUM_SWEEPS";
+        case 0x02087c: return "XM_OOPS_TO_SPOT_ERR";
+        case 0x02087d: return "XM_OUTPUT_JAM_DETECTION_ENABLE";
+        case 0x02087e: return "XM_OUTPUT_JAM_SENSOR_IN_USE";
+        case 0x02087f: return "XM_PAGE_LOADED";
+        case 0x020880: return "XM_PAGES_PRINT_MECH_OT_BEST_INCH_SQ";
+        case 0x020881: return "XM_PAGES_PRINT_MECH_OT_FAST_INCH_SQ";
+        case 0x020882: return "XM_PAGES_PRINT_MECH_OT_NORM_INCH_SQ";
+        case 0x020883: return "XM_PAGES_PRINT_MECH_PL_BEST_INCH_SQ";
+        case 0x020884: return "XM_PAGES_PRINT_MECH_PL_FAST_INCH_SQ";
+        case 0x020885: return "XM_PAGES_PRINT_MECH_PL_NORM_INCH_SQ";
+        case 0x020886: return "XM_PAPER_CAL_NEEDED";
+        case 0x020887: return "XM_PAPER_DESKEW_DIST_MAX";
+        case 0x020888: return "XM_PAPER_DESKEW_DIST_MIN";
+        case 0x020889: return "XM_PAPER_DESKEW_DIST_PHOTO_MAX";
+        case 0x02088a: return "XM_PAPER_DESKEW_DIST_PHOTO_MIN";
+        case 0x02088b: return "XM_PAPER_JAM_CARRIAGE_POSION";
+        case 0x02088d: return "XM_PAPER_OVERSHOOT_ADJUST_FAILED_GPE_CTR";
+        case 0x02088e: return "XM_PAPER_OVERSHOOT_ADJUST_GPE_CTR";
+        case 0x02088f: return "XM_PAPER_PUSH_ADAPTIVE_FAILURE_GPE_CTR";
+        case 0x020890: return "XM_PAPER_PUSH_STALL_LOCKING_WIPER_1_GPE_CTR";
+        case 0x020891: return "XM_PAPER_PUSH_STALL_LOCKING_WIPER_2_GPE_CTR";
+        case 0x020892: return "XM_PAPER_SCALE_LIFE_ADJUST";
+        case 0x020893: return "XM_PAPER_SCALE_LIFE_TRIGGER";
+        case 0x020894: return "XM_PAPER_SCALE_MEASURED_DIST";
+        case 0x020895: return "XM_PAPER_SCALE_MULTIPLIER";
+        case 0x020896: return "XM_PAPER_SCALE_USER_CALIBRATION";
+        case 0x020897: return "XM_PAPER_TR_TO_UPPER_OOPS_NO_TRIGGER_CTR";
+        case 0x020899: return "XM_PEN_CLEANING_LEVEL_0_USER_COUNTER";
+        case 0x02089a: return "XM_PEN_CLEANING_LEVEL_1_USER_COUNTER";
+        case 0x02089b: return "XM_PEN_CLEANING_LEVEL_2_USER_COUNTER";
+        case 0x02089c: return "XM_PEN_MOVE_AND_SPIT_SAS_ALGO_STATE";
+        case 0x02089d: return "XM_PEN_PRIME_COUNTER_INK_PURGE";
+        case 0x02089e: return "XM_PEN_PRIME_COUNTER_TUBE_EVAC";
+        case 0x02089f: return "XM_PEN_PUMP_COUNTER_COLOR_PRIME_LEVEL_0";
+        case 0x0208a0: return "XM_PEN_PUMP_COUNTER_COLOR_PRIME_LEVEL_1";
+        case 0x0208a1: return "XM_PEN_PUMP_COUNTER_COLOR_PRIME_LEVEL_2";
+        case 0x0208a2: return "XM_PEN_PUMP_COUNTER_SOS_PRIME_LEVEL_0";
+        case 0x0208a3: return "XM_PEN_PUMP_COUNTER_SOS_PRIME_LEVEL_1";
+        case 0x0208a4: return "XM_PEN_PUMP_EXEC_TIME_BLACK_LEVEL_0";
+        case 0x0208a5: return "XM_PEN_PUMP_EXEC_TIME_BLACK_LEVEL_1";
+        case 0x0208a6: return "XM_PEN_PUMP_EXEC_TIME_BLACK_LEVEL_2";
+        case 0x0208a7: return "XM_PEN_PUMP_EXEC_TIME_COLOR_LEVEL_0";
+        case 0x0208a8: return "XM_PEN_PUMP_EXEC_TIME_COLOR_LEVEL_1";
+        case 0x0208a9: return "XM_PEN_PUMP_EXEC_TIME_COLOR_LEVEL_2";
+        case 0x0208aa: return "XM_PEN_PUMP_EXEC_TIME_SOS_LEVEL_0";
+        case 0x0208ab: return "XM_PEN_PUMP_EXEC_TIME_SOS_LEVEL_1";
+        case 0x0208ac: return "XM_PEN_PUMP_INK_PURGE_REQUIRED";
+        case 0x0208ad: return "XM_PEN_SERVICE_COUNTER_APE_UNCAP_LEVEL_0";
+        case 0x0208ae: return "XM_PEN_SERVICE_COUNTER_APE_UNCAP_LEVEL_1";
+        case 0x0208af: return "XM_PEN_SERVICE_COUNTER_APE_UNCAP_LEVEL_2";
+        case 0x0208b0: return "XM_PEN_SERVICE_COUNTER_APE_UNCAP_LEVEL_3";
+        case 0x0208b1: return "XM_PEN_SERVICE_COUNTER_CMY_INTERSWEEP_LEVEL_0";
+        case 0x0208b2: return "XM_PEN_SERVICE_COUNTER_CMY_INTERSWEEP_LEVEL_1";
+        case 0x0208b3: return "XM_PEN_SERVICE_COUNTER_CMY_INTERSWEEP_LEVEL_2";
+        case 0x0208b4: return "XM_PEN_SERVICE_COUNTER_EUREKA_LEVEL_0";
+        case 0x0208b5: return "XM_PEN_SERVICE_COUNTER_HEAVY_INK_WIPE_LEVEL_0";
+        case 0x0208b6: return "XM_PEN_SERVICE_COUNTER_JOBS_SINCE_LAST_WIPE";
+        case 0x0208b7: return "XM_PEN_SERVICE_COUNTER_K_INTERSWEEP_LEVEL_0";
+        case 0x0208b8: return "XM_PEN_SERVICE_COUNTER_K_INTERSWEEP_LEVEL_1";
+        case 0x0208b9: return "XM_PEN_SERVICE_COUNTER_K_INTERSWEEP_LEVEL_2";
+        case 0x0208ba: return "XM_PEN_SERVICE_COUNTER_MIDJOB_LEVEL_0";
+        case 0x0208bb: return "XM_PEN_SERVICE_COUNTER_PENCHANGE_LEVEL_0";
+        case 0x0208bc: return "XM_PEN_SERVICE_COUNTER_PENCHANGE_LEVEL_1";
+        case 0x0208bd: return "XM_PEN_SERVICE_COUNTER_POST_IDS_BLACK_LEVEL_0";
+        case 0x0208be: return "XM_PEN_SERVICE_COUNTER_POST_IDS_BLACK_LEVEL_1";
+        case 0x0208bf: return "XM_PEN_SERVICE_COUNTER_POST_IDS_BLACK_LEVEL_2";
+        case 0x0208c0: return "XM_PEN_SERVICE_COUNTER_POST_IDS_COLOR_LEVEL_0";
+        case 0x0208c1: return "XM_PEN_SERVICE_COUNTER_POST_IDS_COLOR_LEVEL_1";
+        case 0x0208c2: return "XM_PEN_SERVICE_COUNTER_POST_IDS_COLOR_LEVEL_2";
+        case 0x0208c3: return "XM_PEN_SERVICE_COUNTER_POST_SACM";
+        case 0x0208c4: return "XM_PEN_SERVICE_COUNTER_POST_STARTUP_BLACK_LEVEL_0";
+        case 0x0208c5: return "XM_PEN_SERVICE_COUNTER_POST_STARTUP_BLACK_LEVEL_1";
+        case 0x0208c6: return "XM_PEN_SERVICE_COUNTER_POST_STARTUP_BLACK_LEVEL_2";
+        case 0x0208c7: return "XM_PEN_SERVICE_COUNTER_POST_STARTUP_COLOR_LEVEL_0";
+        case 0x0208c8: return "XM_PEN_SERVICE_COUNTER_POST_STARTUP_COLOR_LEVEL_1";
+        case 0x0208c9: return "XM_PEN_SERVICE_COUNTER_POSTPAGE_LEVEL_0";
+        case 0x0208ca: return "XM_PEN_SERVICE_COUNTER_POSTPAGE_LEVEL_1";
+        case 0x0208cb: return "XM_PEN_SERVICE_COUNTER_POSTSWEEP_LEVEL_1";
+        case 0x0208cc: return "XM_PEN_SERVICE_COUNTER_PREPAGE_LEVEL_0";
+        case 0x0208cd: return "XM_PEN_SERVICE_COUNTER_PREPAGE_LEVEL_1";
+        case 0x0208ce: return "XM_PEN_SERVICE_COUNTER_PREPAGE_LEVEL_2";
+        case 0x0208cf: return "XM_PEN_SERVICE_COUNTER_PRESWEEP_LEVEL_0";
+        case 0x0208d0: return "XM_PEN_SERVICE_COUNTER_PRESWEEP_LEVEL_1";
+        case 0x0208d1: return "XM_PEN_SERVICE_COUNTER_PRESWEEP_LEVEL_2";
+        case 0x0208d2: return "XM_PEN_SERVICE_COUNTER_SERVICE_MISSING_COLORS";
+        case 0x0208d3: return "XM_PEN_SERVICE_COUNTER_UNCAP_RECOVERY_CMY_LEVEL_0";
+        case 0x0208d4: return "XM_PEN_SERVICE_COUNTER_UNCAP_RECOVERY_CMY_LEVEL_1";
+        case 0x0208d5: return "XM_PEN_SERVICE_COUNTER_UNCAP_RECOVERY_CMY_LEVEL_2";
+        case 0x0208d6: return "XM_PEN_SERVICE_COUNTER_UNCAP_RECOVERY_CMY_LEVEL_3";
+        case 0x0208d7: return "XM_PEN_SERVICE_COUNTER_UNCAP_RECOVERY_K_LEVEL_0";
+        case 0x0208d9: return "XM_PEN_SERVICE_COUNTER_UNCAP_RECOVERY_K_LEVEL_1";
+        case 0x0208da: return "XM_PEN_SERVICE_COUNTER_UNCAP_RECOVERY_K_LEVEL_2";
+        case 0x0208db: return "XM_PEN_SERVICE_COUNTER_UNCAP_RECOVERY_K_LEVEL_3";
+        case 0x0208dc: return "XM_PEN_SERVICE_EXEC_TIME_CAP_LEVEL_2";
+        case 0x0208dd: return "XM_PEN_SERVICE_EXEC_TIME_DECAP_LEVEL_0";
+        case 0x0208de: return "XM_PEN_SERVICE_EXEC_TIME_DIRTY_POWERUP_LEVEL_2";
+        case 0x0208df: return "XM_PEN_SERVICE_EXEC_TIME_DIRTY_POWERUP_LEVEL_3";
+        case 0x0208e0: return "XM_PEN_SERVICE_EXEC_TIME_EUREKA_LEVEL_0";
+        case 0x0208e1: return "XM_PEN_SERVICE_EXEC_TIME_HEAVY_INK_WIPE_LEVEL_0";
+        case 0x0208e2: return "XM_PEN_SERVICE_EXEC_TIME_MIDJOB_LEVEL_2";
+        case 0x0208e3: return "XM_PEN_SERVICE_EXEC_TIME_PEN_RECOVERY_LEVEL_1";
+        case 0x0208e4: return "XM_PEN_SERVICE_EXEC_TIME_PEN_RECOVERY_LEVEL_2";
+        case 0x0208e5: return "XM_PEN_SERVICE_EXEC_TIME_PENCHANGE_LEVEL_0";
+        case 0x0208e6: return "XM_PEN_SERVICE_EXEC_TIME_PENCHANGE_LEVEL_1";
+        case 0x0208e7: return "XM_PEN_SERVICE_EXEC_TIME_POST_IDS_BLACK_LEVEL_0";
+        case 0x0208e8: return "XM_PEN_SERVICE_EXEC_TIME_POST_IDS_BLACK_LEVEL_1";
+        case 0x0208e9: return "XM_PEN_SERVICE_EXEC_TIME_POST_IDS_BLACK_LEVEL_2";
+        case 0x0208ea: return "XM_PEN_SERVICE_EXEC_TIME_POST_IDS_COLOR_LEVEL_0";
+        case 0x0208eb: return "XM_PEN_SERVICE_EXEC_TIME_POST_IDS_COLOR_LEVEL_1";
+        case 0x0208ec: return "XM_PEN_SERVICE_EXEC_TIME_POST_IDS_COLOR_LEVEL_2";
+        case 0x0208ed: return "XM_PEN_SERVICE_EXEC_TIME_POST_SACM";
+        case 0x0208ee: return "XM_PEN_SERVICE_EXEC_TIME_POST_STARTUP_LEVEL_0";
+        case 0x0208ef: return "XM_PEN_SERVICE_EXEC_TIME_POSTSWEEP_LEVEL_1";
+        case 0x0208f0: return "XM_PEN_SERVICE_EXEC_TIME_PRESWEEP_LEVEL_0";
+        case 0x0208f1: return "XM_PEN_SERVICE_EXEC_TIME_PRESWEEP_LEVEL_1";
+        case 0x0208f2: return "XM_PEN_SERVICE_EXEC_TIME_PRESWEEP_LEVEL_2";
+        case 0x0208f7: return "XM_PEN_SERVICE_EXEC_TIME_UNCAP_RECOVERY_K_LEVEL_0";
+        case 0x0208f8: return "XM_PEN_SERVICE_EXEC_TIME_UNCAP_RECOVERY_K_LEVEL_1";
+        case 0x0208f9: return "XM_PEN_SERVICE_EXEC_TIME_UNCAP_RECOVERY_K_LEVEL_2";
+        case 0x0208fa: return "XM_PEN_SERVICE_EXEC_TIME_UNCAP_RECOVERY_K_LEVEL_3";
+        case 0x0208fb: return "XM_PEN_SERVICE_PRIME_ANY_PENDING";
+        case 0x0208fc: return "XM_PEN_SERVICE_PRIME_TRIGGERED";
+        case 0x0208fd: return "XM_PHOTO_MEDIA_FANNING_BUCKET_1_COUNTER";
+        case 0x0208fe: return "XM_PHOTO_MEDIA_FANNING_BUCKET_2_COUNTER";
+        case 0x0208ff: return "XM_PHOTO_MEDIA_FANNING_BUCKET_3_COUNTER";
+        case 0x020900: return "XM_PHOTO_MEDIA_FANNING_BUCKET_4_COUNTER";
+        case 0x020901: return "XM_PHOTO_MEDIA_FANNING_BUCKET_5_COUNTER";
+        case 0x020902: return "XM_PHOTO_MEDIA_FANNING_ERROR_COUNTER";
+        case 0x020903: return "XM_PHOTO_TRAY_DISENGAGE_COUNTER";
+        case 0x020904: return "XM_PHOTO_TRAY_ENABLE";
+        case 0x020905: return "XM_PHOTO_TRAY_ENGAGE_COUNTER";
+        case 0x020906: return "XM_PICK_ALGORITHM_NORMAL";
+        case 0x020907: return "XM_PICK_ALGORITHM_PHOTO";
+        case 0x020908: return "XM_PICK_ARM_LIFT_DISTANCE_TRAVEL";
+        case 0x020909: return "XM_PICK_ARM_LIFT_DISTANCE_TRAVEL_COUNTER";
+        case 0x02090a: return "XM_PICK_ARM_LIFT_DISTANCE_TRAVEL_FAILURE_COUNTER";
+        case 0x02090b: return "XM_PICK_TO_LOWER_OOPS_SHORT_PICK_COUNTER";
+        case 0x02090c: return "XM_POST_OOPS_LOAD_STALL_GPE_CTR";
+        case 0x02090d: return "XM_POST_OOPS_PRE_PINCH_LOAD_STALL_GPE_CTR";
+        case 0x02090e: return "XM_PRE_OOPS_LOAD_STALL_GPE_CTR";
+        case 0x02090f: return "XM_PRIME_AUTO_LAST_BLACK_SERVICE_EVENT";
+        case 0x020910: return "XM_PRIME_AUTO_LAST_COLOR_SERVICE_EVENT";
+        case 0x020911: return "XM_PRIME_BLACK_LEVEL_WAITING_TO_NOTIFY";
+        case 0x020912: return "XM_PRIME_BLACK_MASS_REMAINING_TO_NOTIFY";
+        case 0x020913: return "XM_PRIME_BLACK_TIME_ELAPSED";
+        case 0x020914: return "XM_PRIME_BLACK_TIME_PHA_STORAGE_CAPPED_ACCUM";
+        case 0x020915: return "XM_PRIME_BLACK_TIME_PHA_UNCAPPED_ACCUM";
+        case 0x020916: return "XM_PRIME_COLOR_LEVEL_WAITING_TO_NOTIFY";
+        case 0x020917: return "XM_PRIME_COLOR_MASS_REMAINING_TO_NOTIFY";
+        case 0x020918: return "XM_PRIME_COLOR_RECOVERY_OVERRIDE_LEVEL2";
+        case 0x020919: return "XM_PRIME_COLOR_TIME_ELAPSED";
+        case 0x02091a: return "XM_PRIME_COLOR_TIME_PHA_STORAGE_CAPPED_ACCUM";
+        case 0x02091b: return "XM_PRIME_COLOR_TIME_PHA_UNCAPPED_ACCUM";
+        case 0x02091c: return "XM_PRIME_ENABLE";
+        case 0x02091d: return "XM_PRIME_STARTUP_LOOP_COUNT";
+        case 0x02091e: return "XM_PRIME_SUBSYSTEM_CONFIG";
+        case 0x02091f: return "XM_PRINT_SWEEP_PAPER_STALL_GPE_CTR";
+        case 0x020920: return "XM_PUMP_CALIBRATION_FACTOR";
+        case 0x020921: return "XM_PUMP_CHANNEL_BLACK_PRIME_STATE";
+        case 0x020922: return "XM_PUMP_CHANNEL_BLACK_PWM_FAILURE1";
+        case 0x020923: return "XM_PUMP_CHANNEL_BLACK_PWM1";
+        case 0x020924: return "XM_PUMP_CHANNEL_BLACK_PWM2";
+        case 0x020925: return "XM_PUMP_CHANNEL_COLOR_PRIME_STATE";
+        case 0x020926: return "XM_PUMP_CHANNEL_COLOR_PWM_FAILURE1";
+        case 0x020927: return "XM_PUMP_CHANNEL_COLOR_PWM1";
+        case 0x020928: return "XM_PUMP_CHANNEL_COLOR_PWM2";
+        case 0x020929: return "XM_PUMP_GEAR_RATIO_X100";
+        case 0x02092a: return "XM_PWM_DELTA_SS_COMPONENT_REAR_HOME";
+        case 0x02092b: return "XM_QUIET_CAPPING_FORCE";
+        case 0x02092c: return "XM_REDI_BOOST_PAGE_COUNT_THRESHOLD";
+        case 0x02092d: return "XM_SAFETY_PICKARM_LIFT_DISABLE";
+        case 0x02092e: return "XM_SCAN_ENCODER_MAG_SERVO";
+        case 0x02092f: return "XM_SCAN_ENCODER_OPTO_SERVO";
+        case 0x020930: return "XM_SCAN_ENCODER_RANGE_1";
+        case 0x020931: return "XM_SCAN_ENCODER_RANGE_2";
+        case 0x020932: return "XM_SCAN_ENCODER_RANGE_3";
+        case 0x020933: return "XM_SCAN_ENCODER_RANGE_4";
+        case 0x020934: return "XM_SCAN_ENCODER_RANGE_5";
+        case 0x020935: return "XM_SCAN_ENCODER_RANGE_6";
+        case 0x020936: return "XM_SCAN_ENCODER_RANGE_7";
+        case 0x020937: return "XM_SCAN_ENCODER_RANGE_8";
+        case 0x020938: return "XM_SCAN_UNBLOCK_PRINTING";
+        case 0x020939: return "XM_SENSOR_PREV_TOF_FAILURE_SPEC";
+        case 0x02093a: return "XM_SEPTE_ADJUST_FAILED_GPE_CTR";
+        case 0x02093b: return "XM_SEPTE_ADJUST_GPE_CTR";
+        case 0x02093c: return "XM_SEPTE_STALL_RECOVER_FAILED_GPE_CTR";
+        case 0x02093d: return "XM_SERVICE_CAP_INK_PURGE_COUNTER";
+        case 0x02093e: return "XM_SERVICE_CAP_MAX_TORQUE";
+        case 0x02093f: return "XM_SERVICE_CAP_MAX_TORQUE_POS";
+        case 0x020940: return "XM_SERVICE_CONVEYOR_BELT_MOVE";
+        case 0x020941: return "XM_SERVICE_COUNTER_UNCAP_LOWER_WIPER_RETRY";
+        case 0x020942: return "XM_SERVICE_COUNTER_WIPE_PENS_RETRY";
+        case 0x020943: return "XM_SERVICE_DISENGAGE_MAX_TORQUE";
+        case 0x020944: return "XM_SERVICE_DISENGAGE_MAX_TORQUE_POS";
+        case 0x020945: return "XM_SERVICE_SCRAPE_FWD_AVG_SLEW_TORQUE";
+        case 0x020946: return "XM_SERVICE_SCRAPE_FWD_MAX_TORQUE";
+        case 0x020947: return "XM_SERVICE_SCRAPE_RWD_AVG_SLEW_TORQUE";
+        case 0x020948: return "XM_SERVICE_SCRAPE_RWD_MAX_TORQUE";
+        case 0x020949: return "XM_SERVICE_STATION_CALCULATED_LENGTH";
+        case 0x02094a: return "XM_SERVICE_STATION_LENGTH";
+        case 0x02094b: return "XM_SERVICE_UNCAP_MAX_TORQUE";
+        case 0x02094c: return "XM_SERVICE_UNCAP_MAX_TORQUE_POS";
+        case 0x02094d: return "XM_SERVICE_UNCAP_WIPER_PWM_DELTA_LEFT_1";
+        case 0x02094e: return "XM_SERVICE_UNCAP_WIPER_PWM_DELTA_RIGHT_1";
+        case 0x02094f: return "XM_SERVICE_WIPE_FWD_AVG_SLEW_TORQUE";
+        case 0x020950: return "XM_SERVICE_WIPE_FWD_MAX_TORQUE";
+        case 0x020951: return "XM_SERVICE_WIPE_RWD_AVG_SLEW_TORQUE";
+        case 0x020952: return "XM_SERVICE_WIPE_RWD_MAX_TORQUE";
+        case 0x020953: return "XM_SERVICE_WIPER_PWM_DELTA_LEFT_1";
+        case 0x020954: return "XM_SERVICE_WIPER_PWM_DELTA_LEFT_2";
+        case 0x020955: return "XM_SERVICE_WIPER_PWM_DELTA_RIGHT_1";
+        case 0x020956: return "XM_SERVICE_WIPER_PWM_DELTA_RIGHT_2";
+        case 0x020957: return "XM_SERVO_LFA_DATA";
+        case 0x020958: return "XM_SHIFT_POSITION_CTR_RETRY1";
+        case 0x020959: return "XM_SHIFT_POSITION_CTR_RETRY2";
+        case 0x02095a: return "XM_SHIFT_POSITION_FINAL_ERROR";
+        case 0x02095b: return "XM_SHIFT_POSITION_POST_PUSH_RETRY1";
+        case 0x02095c: return "XM_SHIFT_POSITION_POST_PUSH_RETRY2";
+        case 0x02095d: return "XM_SHIFT_POSITION_PRE_PUSH_RETRY1";
+        case 0x02095e: return "XM_SHIFT_POSITION_PRE_PUSH_RETRY2";
+        case 0x02095f: return "XM_SPIT_AT_SLEW_ENABLE";
+        case 0x020960: return "XM_SS_ACTIVE_PWM_LIMIT";
+        case 0x020961: return "XM_SS_CAL_SERVICE_STATION_FAIL_COUN";
+        case 0x020962: return "XM_SS_DISENGAGE_TO_REAR_HOME_DIST";
+        case 0x020963: return "XM_SS_FORCE_PEAK_CAP";
+        case 0x020964: return "XM_SS_FRONT_TORQUE_LIMIT";
+        case 0x020965: return "XM_SS_PIN_DROP_ATTEMPT_1_SUCESS";
+        case 0x020966: return "XM_SS_PIN_DROP_ATTEMPT_2_FAILURE";
+        case 0x020967: return "XM_SS_PIN_DROP_ATTEMPT_2_SUCESS";
+        case 0x020968: return "XM_SS_REAR_HOME_PWM_LIMIT";
+        case 0x020969: return "XM_SS_REAR_HOME_PWM_LIMIT_MAX";
+        case 0x02096a: return "XM_SS_REAR_HOME_SPEED";
+        case 0x02096b: return "XM_SS_REAR_TORQUE_LIMIT";
+        case 0x02096c: return "XM_STACK_EMPTY_MAIN_TRAY_TORQUE_BASED_CAL";
+        case 0x02096d: return "XM_STACK_FULL_MAIN_TRAY_TORQUE_BASED_CAL";
+        case 0x02096e: return "XM_SUPPLY_MISSING_TIME_ACCUM_C";
+        case 0x02096f: return "XM_SUPPLY_MISSING_TIME_ACCUM_K";
+        case 0x020970: return "XM_SUPPLY_MISSING_TIME_ACCUM_LK";
+        case 0x020971: return "XM_SUPPLY_MISSING_TIME_ACCUM_M";
+        case 0x020972: return "XM_SUPPLY_MISSING_TIME_ACCUM_Y";
+        case 0x020973: return "XM_SUPPLY_MISSING_TIME_AT_SHUTDOWN";
+        case 0x020974: return "XM_TIME_PRIME_IN_CAP_AT_SHUTDOWN";
+        case 0x020975: return "XM_TIME_SINCE_LAST_GREMLIN_MODE_AT_SHUTDOWN";
+        case 0x020976: return "XM_TIMER_01";
+        case 0x020977: return "XM_TIMER_06";
+        case 0x020978: return "XM_TIMER_07";
+        case 0x020979: return "XM_TIMER_11";
+        case 0x02097a: return "XM_TIMER_31";
+        case 0x02097b: return "XM_TIMER_39";
+        case 0x02097c: return "XM_TIMER_40";
+        case 0x02097d: return "XM_TIMER_43";
+        case 0x02097e: return "XM_TIMER_44";
+        case 0x02097f: return "XM_TIMER_45";
+        case 0x020980: return "XM_TIMER_46";
+        case 0x020981: return "XM_TIMER_47";
+        case 0x020982: return "XM_TIMER_48";
+        case 0x020983: return "XM_TIMER_49";
+        case 0x020984: return "XM_TIMER_50";
+        case 0x020985: return "XM_TOTAL_DUPLEX_USAGE_COUNT";
+        case 0x020986: return "XM_TOTAL_ENGINE_PAGE_COUNT";
+        case 0x020987: return "XM_TOTAL_JOB_COUNT";
+        case 0x020988: return "XM_TOTAL_PHOTO_TRAY_COUNT";
+        case 0x020989: return "XM_TOTAL_SCAN_DUPLEX_COUNT";
+        case 0x02098a: return "XM_TOTAL_SCAN_PAGE_COUNT";
+        case 0x02098c: return "XM_TRAY_LOCK_RETRY_TIME_IN_SEC";
+        case 0x02098d: return "XM_TRAY_WIDTH_SIZE_LARGE_LOWER";
+        case 0x02098e: return "XM_TRAY_WIDTH_SIZE_LARGE_UPPER";
+        case 0x02098f: return "XM_TRAY_WIDTH_SIZE_MEDIUM_LOWER";
+        case 0x020990: return "XM_TRAY_WIDTH_SIZE_MEDIUM_UPPER";
+        case 0x020991: return "XM_TRAY_WIDTH_SIZE_SMALL_LOWER";
+        case 0x020992: return "XM_TRAY_WIDTH_SIZE_SMALL_UPPER";
+        case 0x020993: return "XM_TRD_PICK2_PWM_LIMIT";
+        case 0x020994: return "XM_TRD_PICK2_SPEED";
+        case 0x020995: return "XM_TRD_PICK2_STALL_LIMIT";
+        case 0x020996: return "XM_TRD_PICK3_DELAY";
+        case 0x020997: return "XM_TRD_PICK3_DIST";
+        case 0x020998: return "XM_TRD_PICK3_PWM_LIMIT";
+        case 0x020999: return "XM_TRD_PICK3_SPEED_PAPER";
+        case 0x02099a: return "XM_TUBE_SLEW_COUNTER";
+        case 0x02099b: return "XM_UNCAP_MAX_PWM";
+        case 0x02099c: return "XM_USE_MISR_PROFILE";
+        case 0x02099d: return "XM_USE_NAREL_GPE_ACTION";
+        case 0x02099e: return "XM_WVTR_CAL_FAILURE_C";
+        case 0x02099f: return "XM_WVTR_CAL_FAILURE_K";
+        case 0x0209a0: return "XM_WVTR_CAL_FAILURE_LK";
+        case 0x0209a1: return "XM_WVTR_CAL_FAILURE_M";
+        case 0x0209a2: return "XM_WVTR_CAL_FAILURE_Y";
+        case 0x0209a3: return "XM_WVTR_CAL_FAILURES";
+        case 0x0209a4: return "XM_WVTR_REQ_TIME";
+        case 0x0209a5: return "XM_WVTR_TIME_ELAPSED";
+        case 0x0209a6: return "XM_ZIM_TOTALLY_FAILED_FOR_THIS_UNIT";
+        case 0x0209a7: return "IDS_RESERVOIR_ILG_DEFICIENT_K";
+        case 0x0209a8: return "IDS_RESERVOIR_ILG_DEFICIENT_C";
+        case 0x0209a9: return "IDS_RESERVOIR_ILG_DEFICIENT_M";
+        case 0x0209aa: return "IDS_RESERVOIR_ILG_DEFICIENT_Y";
+        case 0x0209ab: return "MI_SERVO_NVM_BLOCK";
+        case 0x0209ac: return "MI_SERVO_PROTECTED_NVM_BLOCK";
+        case 0x0209ad: return "THERM_MDL_OPTIONS";
+        case 0x0209ae: return "THERM_MDL_STATE_BLOCK";
+        case 0x0209af: return "MCASIC_RESET_CAUSE1";
+        case 0x0209b0: return "MCASIC_RESET_CAUSE2";
+        case 0x0209b1: return "MCASIC_RESET_CAUSE3";
+        case 0x0209b2: return "MCASIC_RESET_CAUSE4";
+        case 0x0209b3: return "MCASIC_RESET_CAUSE5";
+        case 0x0209b4: return "MCASIC_RESET_CAUSE6";
+        case 0x0209b5: return "MCASIC_RESET_TIME_STAMP1";
+        case 0x0209b6: return "MCASIC_RESET_TIME_STAMP2";
+        case 0x0209b7: return "MCASIC_RESET_TIME_STAMP3";
+        case 0x0209b8: return "MCASIC_RESET_TIME_STAMP4";
+        case 0x0209b9: return "MCASIC_RESET_TIME_STAMP5";
+        case 0x0209ba: return "MCASIC_RESET_TIME_STAMP6";
+        case 0x0209bb: return "MCASIC_MAX_IC_TEMP1";
+        case 0x0209bc: return "MCASIC_MAX_IC_TEMP2";
+        case 0x0209bd: return "MCASIC_PAGE_COUNT_RESET_CAUSE1";
+        case 0x0209be: return "MCASIC_PAGE_COUNT_RESET_CAUSE2";
+        case 0x0209bf: return "MCASIC_PAGE_COUNT_RESET_CAUSE3";
+        case 0x0209c0: return "MCASIC_PAGE_COUNT_RESET_CAUSE4";
+        case 0x0209c1: return "MCASIC_PAGE_COUNT_RESET_CAUSE5";
+        case 0x0209c2: return "MCASIC_PAGE_COUNT_RESET_CAUSE6";
+        case 0x0209c3: return "MCASIC_WARM_ERROR";
+        case 0x0209c4: return "MCASIC_OVER_TEMP_ERROR";
+        case 0x0209c5: return "MCASIC_EXT_RESET_ERROR";
+        case 0x0209c6: return "MCASIC_V3_3_UVLO_ERROR";
+        case 0x0209c7: return "MCASIC_V32_UVLO_ERROR";
+        case 0x0209c8: return "MCASIC_VBOOST_UVLO_ERROR";
+        case 0x0209c9: return "MCASIC_VEXT_UVLO_ERROR";
+        case 0x0209ca: return "MCASIC_VINT_UVLO_ERROR";
+        case 0x0209cb: return "MCASIC_PASS_SW_A_ERROR";
+        case 0x0209cc: return "MCASIC_MOTOR_A_ERROR";
+        case 0x0209cd: return "MCASIC_MOTOR_B_ERROR";
+        case 0x0209ce: return "MCASIC_MOTOR_B_A_ERROR";
+        case 0x0209cf: return "MCASIC_MOTOR_B_B_ERROR";
+        case 0x0209d0: return "MCASIC_MOTOR_C_A_ERROR";
+        case 0x0209d1: return "MCASIC_MOTOR_C_B_ERROR";
+        case 0x0209d2: return "MCASIC_VREG0_IL_ERROR";
+        case 0x0209d3: return "MCASIC_VREG0_UV_ERROR";
+        case 0x0209d4: return "MCASIC_VREG1_IL_ERROR";
+        case 0x0209d5: return "MCASIC_VREG1_UV_ERROR";
+        case 0x0209d6: return "MCASIC_VREG2_IL_ERROR";
+        case 0x0209d7: return "MCASIC_VREG2_UV_ERROR";
+        case 0x0209d8: return "MCASIC_VREG3_IL_ERROR";
+        case 0x0209d9: return "MCASIC_VREG3_UV_ERROR";
+        case 0x0209da: return "MCASIC_VREG4_IL_ERROR";
+        case 0x0209db: return "MCASIC_VREG4_UV_ERROR";
+        case 0x0209dc: return "MCASIC_V32_BROWN_OUT_ERROR";
+        case 0x0209dd: return "MCASIC_WATCHDOG_ERROR";
+        case 0x0209de: return "MCASIC_PASS_SW_B_ERROR";
+        case 0x0209df: return "MCASIC_PASS_SW_C_ERROR";
+        case 0x0209e0: return "MCASIC_PASS_SW_D_ERROR";
+        case 0x0209e1: return "MCASIC_PASS_SW_E_ERROR";
+        case 0x0209e2: return "MCASIC_MOTOR_D_A_ERROR";
+        case 0x0209e3: return "MCASIC_MOTOR_D_B_ERROR";
+        case 0x0209e4: return "MCASIC_POWER_BUTTON_RESET";
+        case 0x0209e5: return "SYSTEM_RESET_COUNT";
+        case 0x0209e6: return "HEALTH_CHECK";
+        case 0x0209e7: return "DS2_NVM_RESET_BITS";
+        case 0x0209e8: return "NM_SECURITY_KEY_MODIFIER";
+        case 0x0209e9: return "MFG_DATE_EPOCH";
+        case 0x0209ea: return "PRINTER_PIN";
+        case 0x0209eb: return "FIRM_RECORD";
+        case 0x0209ec: return "afax_receive_images_archived";
+        case 0x0209ed: return "enginePrintQualityDryTimeSetting";
+        case 0x0209ee: return "ePrint_BlankSides";
+        case 0x0209ef: return "ePrint_Copy_BlankSides";
+        case 0x0209f0: return "ePrint_Copy_MonoImpressions";
+        case 0x0209f1: return "ePrint_Copy_ColorImpressions";
+        case 0x0209f2: return "ePrint_FaxIn_BlankSides";
+        case 0x0209f3: return "ePrint_FaxIn_MonoImpressions";
+        case 0x0209f4: return "ePrint_FaxIn_ColorImpressions";
+        case 0x0209f5: return "ePrint_PrintOther_BlankSides";
+        case 0x0209f6: return "ePrint_PrintOther_MonoImpressions";
+        case 0x0209f7: return "ePrint_PrintOther_ColorImpressions";
+        case 0x0209f8: return "ePrint_PrintOther_TotalImpressions";
+        case 0x0209f9: return "SaveRecoverDeviceSetupStatusProviderBlock";
+        case 0x0209fa: return "SaveRecoverPrintEngineOobePolicyBlock";
+        case 0x0209fb: return "IS_EOW_DATE_K";
+        case 0x0209fc: return "IS_EOW_DATE_C";
+        case 0x0209fd: return "IS_EOW_DATE_M";
+        case 0x0209fe: return "IS_EOW_DATE_Y";
+        case 0x0209ff: return "IS_PREVIOUS_EOW_DATE_K";
+        case 0x020a00: return "IS_PREVIOUS_EOW_DATE_C";
+        case 0x020a01: return "IS_PREVIOUS_EOW_DATE_M";
+        case 0x020a02: return "IS_PREVIOUS_EOW_DATE_Y";
+        case 0x020a03: return "XM_LOAD_SKEW_BUCKET4";
+        case 0x020a04: return "SaveRecoverPrinterNetworkOnboardingOobeActionBlock";
+        case 0x020a05: return "SaveRecoverMiServoBlock";
+        case 0x020a06: return "SaveRecoverLocalizationConfigProviderBlock";
+        case 0x020a07: return "SaveRecoverDeviceSetupManagerBlock";
+        case 0x020a08: return "SaveRecoverOobeAppBlock";
+        case 0x020a09: return "SaveRecoverthermMdlBlock";
+        case 0x020a0a: return "SaveRecoverConstatBlock";
+        case 0x020a0b: return "SaveRecoverCriticalFwUpdateOobePolicyBlock";
+        case 0x020a0c: return "SaveRecoverAcumenIntegrityBlock";
+        case 0x020a0d: return "SaveRecoverInkSupplyBlock";
+        case 0x020a0e: return "SaveRecoverInkSupplyFrequentBlock";
+        case 0x020a0f: return "SaveRecoverXmBlock";
+        case 0x020a10: return "SaveRecoverXmBeamBlock";
+        case 0x020a11: return "SaveRecoverXmRecBlock";
+        case 0x020a12: return "SaveRecoverSensorZimBlock";
+        case 0x020a33: return "SaveRecoverPenTij4Part1Block";
+        case 0x020a34: return "SaveRecoverPenTij4Part2Block";
+        case 0x020a35: return "SaveRecoverPeCntrsBlock";
+        case 0x020a36: return "SaveRecoverPeSvcDiagnosticsBlock";
+        case 0x020a37: return "peInitAllowed";
+        case 0x020a38: return "XM_PUNTED_SWEEP_PAPER_STILL_MOVING_COUNT";
+        case 0x020a39: return "XM_PUNTED_SWEEP_PEN_NOT_READY_COUNT";
+        case 0x020a3a: return "XM_CRG_SLED_DISENGAGE_STALL_CNT";
+        case 0x020a3b: return "CNST_SA_INSERTION_ACK_BITS";
+        case 0x020a3c: return "CNST_SA_ACCEPTED_PER_PROFILE_BITS";
+        case 0x020a3d: return "STACK_HEIGHT_DISABLED";
+        case 0x020a3e: return "STACK_HEIGHT_SETTLING_TIME";
+        case 0x020a3f: return "CNST_CONSTAT_HOLO_ENABLED_STATE";
+        case 0x020a40: return "SaveRecoverIdsCommonBlock";
+        case 0x020a41: return "SaveRecoverIdsPublicBlock";
+        case 0x020a42: return "SaveRecoverIdsPrivateBlock";
+        case 0x020a43: return "SaveRecoverEwsCdmAdapterBlock";
+        case 0x020a44: return "engineJamRecoveryMode";
+        case 0x020a45: return "peShipsWithPaperTrayPackaging";
+        case 0x020a46: return "peShipsWithCarriageRestraint";
+        case 0x020a47: return "Dot11LocaleOverride";
+        case 0x020a48: return "Dot115GHzBandOverride";
+        case 0x020a49: return "XM_FM_LOW_ON_PAPER_MESSAGE_ENABLE";
+        case 0x020a4a: return "STACK_HEIGHT_SAMPLING_RATE";
+        case 0x020a4b: return "SaveRecoverNetworkManagerBlock";
+        case 0x020a4c: return "SaveRecoverInkSupplyBlockTwo";
+        case 0x020a4d: return "SaveRecoverInkSupplyUncommonBlock";
+        case 0x020a4e: return "SaveRecoverInkSupplyUncommonBlockTwo";
+        case 0x020a4f: return "engineOobeState";
+        case 0x020a50: return "CNST_CONSTAT_SWAP_CONTROL_ENABLED";
+        case 0x020a51: return "XM_PEN_SERVICE_COUNTER_MIDJOB_LEVEL_0_3";
+        case 0x020a52: return "XM_PEN_SERVICE_COUNTER_DECAP_LEVEL_3";
+        case 0x020a53: return "Counters_DuplexImpressions";
+        case 0x020a54: return "Counters_BorderlessImpressions";
+        case 0x020a55: return "Counters_Tray1Impressions";
+        case 0x020a56: return "Counters_Tray2Impressions";
+        case 0x020a57: return "Counters_UserCleanCount";
+        case 0x020a58: return "IDS_WVTR_LAST_UPDATE_TIME_K";
+        case 0x020a59: return "IDS_WVTR_LAST_UPDATE_TIME_C";
+        case 0x020a5a: return "IDS_WVTR_LAST_UPDATE_TIME_M";
+        case 0x020a5b: return "IDS_WVTR_LAST_UPDATE_TIME_Y";
+        case 0x020a5c: return "XM_MECH_PRIME_AMT_K_AT_MISR_REQUEST";
+        case 0x020a5d: return "XM_MECH_PRIME_AMT_C_AT_MISR_REQUEST";
+        case 0x020a5e: return "XM_MECH_PRIME_AMT_M_AT_MISR_REQUEST";
+        case 0x020a5f: return "XM_MECH_PRIME_AMT_Y_AT_MISR_REQUEST";
+        case 0x020a60: return "misrTelemetrySupplementalTimestamp";
+        case 0x020a61: return "XM_MISR_SERVICE_EXEC_TIME";
+        case 0x020a62: return "LOW_ON_PAPER_NON_STICKY_MUTE_DISABLED";
+        case 0x020a63: return "IS_LEGACY_SESSION_INK_USAGE_LIMIT_K";
+        case 0x020a64: return "IS_LEGACY_SESSION_INK_USAGE_LIMIT_C";
+        case 0x020a65: return "IS_LEGACY_SESSION_INK_USAGE_LIMIT_M";
+        case 0x020a66: return "IS_LEGACY_SESSION_INK_USAGE_LIMIT_Y";
+        case 0x020a67: return "XM_PEN_SERVICE_COUNTER_NEW_PEN_LEVEL_0";
+        case 0x020a68: return "XM_PEN_SERVICE_COUNTER_NEW_PEN_LEVEL_1";
+        case 0x020a69: return "eSupplyPCR8004Perm0TagK";
+        case 0x020a6a: return "eSupplyPCR8004Perm0TagC";
+        case 0x020a6b: return "eSupplyPCR8004Perm0TagM";
+        case 0x020a6c: return "eSupplyPCR8004Perm0TagY";
+        case 0x020a6d: return "eSupplyPCR8004Perm0TagD";
+        case 0x020a6e: return "eSupplyCSTDeltasK";
+        case 0x020a6f: return "eSupplyCSTDeltasC";
+        case 0x020a70: return "eSupplyCSTDeltasM";
+        case 0x020a71: return "eSupplyCSTDeltasY";
+        case 0x020a72: return "eSupplyCSTDeltasD";
+        case 0x020a73: return "LSCD_EKEY_HBK";
+        case 0x020a74: return "LSCD_EKEY_TAG";
+        case 0x020a75: return "XM_PEN_SERVICE_COUNTER_MIDJOB_LEVEL_0_4";
+        case 0x020a76: return "XM_PEN_SERVICE_COUNTER_DECAP_LEVEL_4";
+        case 0x020a77: return "eSuppressEngcommError";
+        case 0x020a78: return "eSupplyHistoryEntriesExtK";
+        case 0x020a79: return "eSupplyHistoryEntriesExtC";
+        case 0x020a7a: return "eSupplyHistoryEntriesExtM";
+        case 0x020a7b: return "eSupplyHistoryEntriesExtY";
+        case 0x020a7c: return "eSupplyHistoryEntriesExtD";
+        case 0x020a7d: return "XM_MISR_SERVICE_SIGNAL_SPIT_AMOUNT";
+        case 0x020a7e: return "CISS_PURGE_COMPLETE";
+        case 0x020a7f: return "INK_SUPPLY_PVP_C";
+        case 0x020a80: return "INK_SUPPLY_PVP_K";
+        case 0x020a81: return "INK_SUPPLY_PVP_LC";
+        case 0x020a82: return "INK_SUPPLY_PVP_LK";
+        case 0x020a83: return "INK_SUPPLY_PVP_LM";
+        case 0x020a84: return "INK_SUPPLY_PVP_M";
+        case 0x020a85: return "INK_SUPPLY_PVP_Y";
+        case 0x020a86: return "INK_SUPPLY_TOTAL_HP_INK_INSERTED";
+        case 0x020a87: return "IPH_CISS_II_ENABLE";
+        case 0x020a88: return "K_PEN_SPITTOON_COUNTER_INDICATOR";
+        case 0x020a89: return "MFG_MONTHS_FROM_1970";
+        case 0x020a8a: return "MFG_MONTHS_FROM_1970_AT_MFG";
+        case 0x020a8b: return "OLD_PEN_INSERTED";
+        case 0x020a8c: return "PAGES_PRINT_MECH_CMY_DENSITY_BIN1";
+        case 0x020a8d: return "PAGES_PRINT_MECH_CMY_DENSITY_BIN2";
+        case 0x020a8e: return "PAGES_PRINT_MECH_CMY_DENSITY_BIN3";
+        case 0x020a8f: return "PAGES_PRINT_MECH_CMY_DENSITY_BIN4";
+        case 0x020a90: return "PAGES_PRINT_MECH_K_DENSITY_BIN1";
+        case 0x020a91: return "PAGES_PRINT_MECH_K_DENSITY_BIN2";
+        case 0x020a92: return "PAGES_PRINT_MECH_K_DENSITY_BIN3";
+        case 0x020a93: return "PENS_INITIALIZED";
+        case 0x020a94: return "PEN_ALLOW_PROTO";
+        case 0x020a95: return "PEN_ANTI_THEFT_ALTERNATE_ID";
+        case 0x020a96: return "PEN_ANTI_THEFT_ALTERNATE_ID_COUNT";
+        case 0x020a97: return "PEN_ANTI_THEFT_ENABLE";
+        case 0x020a98: return "PEN_ASN_ADJUST_CMY";
+        case 0x020a99: return "PEN_ASN_ADJUST_K";
+        case 0x020a9a: return "PEN_BEST_GUESS_TIME_INCLUDES_SERVICE_ID";
+        case 0x020a9b: return "PEN_BEST_GUESS_TIME_SECONDS";
+        case 0x020a9c: return "PEN_BEST_GUESS_TIME_UPTIME_BASE_SECONDS";
+        case 0x020a9d: return "PEN_BTM_ACK_CMY";
+        case 0x020a9e: return "PEN_BTM_ACK_K";
+        case 0x020a9f: return "PEN_BTM_PENDING_CMY";
+        case 0x020aa0: return "PEN_BTM_PENDING_K";
+        case 0x020aa1: return "PEN_CHUTE_DS_LEFT_BAD_TSR_COUNT";
+        case 0x020aa2: return "PEN_CHUTE_DS_LEFT_CALIBRATION_ACCURACY";
+        case 0x020aa3: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TEMPERATURE";
+        case 0x020aa4: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR";
+        case 0x020aa5: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_0_BOTTOM";
+        case 0x020aa6: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_0_MAIN";
+        case 0x020aa7: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_0_TOP";
+        case 0x020aa8: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_1_BOTTOM";
+        case 0x020aa9: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_1_MAIN";
+        case 0x020aaa: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_1_TOP";
+        case 0x020aab: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_2_BOTTOM";
+        case 0x020aac: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_2_MAIN";
+        case 0x020aad: return "PEN_CHUTE_DS_LEFT_CALIBRATION_TSR_SLIVER_2_TOP";
+        case 0x020aae: return "PEN_CHUTE_DS_LEFT_CURRENT_TRIGGER_LEVEL";
+        case 0x020aaf: return "PEN_CHUTE_DS_LEFT_DRIVER_ACK";
+        case 0x020ab0: return "PEN_CHUTE_DS_LEFT_DTSR_CURRENT";
+        case 0x020ab1: return "PEN_CHUTE_DS_LEFT_DTSR_SLOPE";
+        case 0x020ab2: return "PEN_CHUTE_DS_LEFT_EMPTY_INK_LEVEL";
+        case 0x020ab3: return "PEN_CHUTE_DS_LEFT_NON_HP_INK";
+        case 0x020ab4: return "PEN_CHUTE_DS_LEFT_OPEN_PIN_EVENT_COUNT";
+        case 0x020ab5: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_0";
+        case 0x020ab6: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_1";
+        case 0x020ab7: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_10";
+        case 0x020ab8: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_11";
+        case 0x020ab9: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_12";
+        case 0x020aba: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_13";
+        case 0x020abb: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_14";
+        case 0x020abc: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_15";
+        case 0x020abd: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_16";
+        case 0x020abe: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_17";
+        case 0x020abf: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_18";
+        case 0x020ac0: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_19";
+        case 0x020ac1: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_2";
+        case 0x020ac2: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_20";
+        case 0x020ac3: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_21";
+        case 0x020ac4: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_22";
+        case 0x020ac5: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_23";
+        case 0x020ac6: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_24";
+        case 0x020ac7: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_25";
+        case 0x020ac8: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_26";
+        case 0x020ac9: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_27";
+        case 0x020aca: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_28";
+        case 0x020acb: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_29";
+        case 0x020acc: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_3";
+        case 0x020acd: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_30";
+        case 0x020ace: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_31";
+        case 0x020acf: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_32";
+        case 0x020ad0: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_33";
+        case 0x020ad1: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_34";
+        case 0x020ad2: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_35";
+        case 0x020ad3: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_36";
+        case 0x020ad4: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_37";
+        case 0x020ad5: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_38";
+        case 0x020ad6: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_39";
+        case 0x020ad7: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_4";
+        case 0x020ad8: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_40";
+        case 0x020ad9: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_41";
+        case 0x020ada: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_5";
+        case 0x020adb: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_6";
+        case 0x020adc: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_7";
+        case 0x020add: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_8";
+        case 0x020ade: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_9";
+        case 0x020adf: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_ADDR_MODE_LAST_GOOD";
+        case 0x020ae0: return "PEN_CHUTE_DS_LEFT_PEN_ID_BITS_OFFSET_42";
+        case 0x020ae1: return "PEN_CHUTE_DS_LEFT_PEN_ID_VERSION";
+        case 0x020ae2: return "PEN_CHUTE_DS_LEFT_PEN_REJECTED_LAST_TIME";
+        case 0x020ae3: return "PEN_CHUTE_DS_LEFT_PEN_REJECTION_COUNT";
+        case 0x020ae4: return "PEN_CHUTE_DS_LEFT_PEN_SILICON_SUBTYPE";
+        case 0x020ae5: return "PEN_CHUTE_DS_LEFT_PEN_TYPE";
+        case 0x020ae6: return "PEN_CHUTE_DS_LEFT_UDW_FIRE_PULSE_OVERRIDE";
+        case 0x020ae7: return "PEN_CHUTE_DS_LEFT_UDW_FIRE_PULSE_OVERRIDE_ENABLED";
+        case 0x020ae8: return "PEN_CHUTE_DS_LEFT_UDW_FIRE_PULSE_OVERRIDE_EVEN";
+        case 0x020aea: return "PEN_CHUTE_DS_LEFT_UDW_FIRE_PULSE_OVERRIDE_LDW";
+        case 0x020aec: return "PEN_CHUTE_DS_LEFT_UDW_FIRE_PULSE_OVERRIDE_ODD";
+        case 0x020aee: return "PEN_CHUTE_DS_LEFT_UDW_FIRE_PULSE_OVERRIDE_SIMUL";
+        case 0x020af0: return "PEN_CHUTE_DS_LEFT_UNKNOWN_INK_LEVEL";
+        case 0x020af1: return "PEN_CHUTE_DS_LEFT_VIRGIN_AT_LAST_CHANGE";
+        case 0x020af2: return "PEN_CHUTE_DS_LEFT_VIRGIN_PEN";
+        case 0x020af3: return "PEN_CHUTE_DS_RIGHT_BAD_TSR_COUNT";
+        case 0x020af4: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_ACCURACY";
+        case 0x020af5: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TEMPERATURE";
+        case 0x020af6: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR";
+        case 0x020af7: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_0_BOTTOM";
+        case 0x020af8: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_0_MAIN";
+        case 0x020af9: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_0_TOP";
+        case 0x020afa: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_1_BOTTOM";
+        case 0x020afb: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_1_MAIN";
+        case 0x020afc: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_1_TOP";
+        case 0x020afd: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_2_BOTTOM";
+        case 0x020afe: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_2_MAIN";
+        case 0x020aff: return "PEN_CHUTE_DS_RIGHT_CALIBRATION_TSR_SLIVER_2_TOP";
+        case 0x020b00: return "PEN_CHUTE_DS_RIGHT_CURRENT_TRIGGER_LEVEL";
+        case 0x020b01: return "PEN_CHUTE_DS_RIGHT_DRIVER_ACK";
+        case 0x020b02: return "PEN_CHUTE_DS_RIGHT_DTSR_CURRENT";
+        case 0x020b03: return "PEN_CHUTE_DS_RIGHT_DTSR_SLOPE";
+        case 0x020b04: return "PEN_CHUTE_DS_RIGHT_EMPTY_INK_LEVEL";
+        case 0x020b05: return "PEN_CHUTE_DS_RIGHT_NON_HP_INK";
+        case 0x020b06: return "PEN_CHUTE_DS_RIGHT_OPEN_PIN_EVENT_COUNT";
+        case 0x020b07: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_0";
+        case 0x020b08: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_1";
+        case 0x020b09: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_10";
+        case 0x020b0a: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_11";
+        case 0x020b0b: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_12";
+        case 0x020b0c: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_13";
+        case 0x020b0d: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_14";
+        case 0x020b0e: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_15";
+        case 0x020b0f: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_16";
+        case 0x020b10: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_17";
+        case 0x020b11: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_18";
+        case 0x020b12: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_19";
+        case 0x020b13: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_2";
+        case 0x020b14: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_20";
+        case 0x020b15: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_21";
+        case 0x020b16: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_22";
+        case 0x020b17: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_23";
+        case 0x020b18: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_24";
+        case 0x020b19: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_25";
+        case 0x020b1a: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_26";
+        case 0x020b1b: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_27";
+        case 0x020b1c: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_28";
+        case 0x020b1d: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_29";
+        case 0x020b1e: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_3";
+        case 0x020b1f: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_30";
+        case 0x020b20: return "PEN_CHUTE_DS_RIGHT_PEN_ID_BITS_31";
+        case 0x040012: return "MFG_ICT_DS_2";
+        case 0x040016: return "MFG_ICT_DS_3";
+        case 0x04001a: return "MFG_ICT_DS_CS";
+        case 0x040052: return "PSKU_CONFIG";
+        case 0x040056: return "ASSERT_SEQ_NUM";
+        case 0x04005a: return "MAP2_VERSION";
+        case 0x040062: return "PSKU_CONFIG";
+        case 0x040066: return "ASSERT_SEQ_NUM";
+        case 0x04006a: return "MAP2_VERSION";
+        case 0x040123: return "MPCA_BPCA_PAIRING";
+        case 0x040127: return "POWER_STATE2";
+        case 0x040131: return "MAP_REVISION";
+        case 0x06010c: return "WLAN0_MAC_ADDR";
+        case 0x060112: return "WLAN1_MAC_ADDR";
+        case 0x060118: return "POWER_CYCLE_COUNT";
+        case 0x0a0102: return "ETH0_MAC_ADDR";
+        case 0x14002f: return "BOOT_FLAGS";
+
+        // ----------------------------------------------------------------
+        // 6.28.1.47 EEPROM dump — additional mappings resolved from the
+        // libNvram.so global name-ID table (ELF 0x5fe4c..0x67964). The
+        // non-v2 records (tags 0x03/0x04/0x05) resolve against the same
+        // global table because the Layer-1 decryption is tag-agnostic
+        // (see NVM_Objects_Inventory.md §B). Offsets in comments refer
+        // to the 6.28.x dump.
+        // ----------------------------------------------------------------
+
+        // v=2 HP_DUNE_SETTINGS — counters, supply metadata, scan stats
+        case 0x020D30: return "SCHEDULER_AUTO_RECOVERY";
+        case 0x020D6C: return "ScanIsaBornOnDate";
+        case 0x020D6D: return "ScanAdfBornOnDate";
+        case 0x020D6F: return "UlyssesBR1CountersFixed";
+        case 0x020DE3: return "eScan_AdfTotalCount";
+        case 0x020E21: return "ePrint_A4Equivalent_FullColorImpressions";
+        case 0x020E22: return "ePrint_A4Equivalent_PrintOther_FullColorImpressions";
+        case 0x020E23: return "ePrint_A4Equivalent_Copy_FullColorImpressions";
+        case 0x020E25: return "ePrint_FullColorImpressions";
+        case 0x020E26: return "ePrint_Copy_FullColorImpressions";
+        case 0x020E28: return "ePrint_PrintOther_FullColorImpressions";
+        case 0x020E78: return "tupperwareSingleUseToken";
+        case 0x020EAA: return "NumberOfSuppliesK";
+        case 0x020EAB: return "NumberOfSuppliesC";
+        case 0x020EAC: return "NumberOfSuppliesM";
+        case 0x020EAD: return "NumberOfSuppliesY";
+        case 0x020EAE: return "SuppliesImpressionsYieldK";
+        case 0x020EAF: return "SuppliesImpressionsYieldC";
+        case 0x020EB0: return "SuppliesImpressionsYieldM";
+        case 0x020EB1: return "SuppliesImpressionsYieldY";
+        case 0x020EF0: return "ScanAdfSimpCount";
+        case 0x020EF1: return "ScanAdfDupCount";
+        case 0x020EF2: return "ScanFbCount";
+        case 0x020EF3: return "ScanTotPagesPicked";
+        case 0x020EF4: return "ScanNoPickCount";
+        case 0x020EF5: return "ScanPickRetryCount";
+        case 0x020EF6: return "ScanMotorStallCount";
+        case 0x020EF7: return "ScanAvgPickToDeskewDist";
+        case 0x020EF8: return "ScanAvgDeskewToTofDist";
+        case 0x020EF9: return "ScanFullCalCount";
+        case 0x020EFB: return "ScanPrnuCalCount";
+        case 0x020F01: return "eSupplyRequeuePFDK";
+        case 0x020F02: return "eSupplyRequeuePFDC";
+        case 0x020F03: return "eSupplyRequeuePFDM";
+        case 0x020F04: return "eSupplyRequeuePFDY";
+        case 0x020FC3: return "eEngineLongMediaEnabled";
+        case 0x020FCC: return "ePairingErrorSystemRebootFlag";
+
+        // v=2 HP_DUNE_SETTINGS — NvramAdapterTest probe records (0x3E76..0x3E7D)
+        case 0x023E76: return "NvramAdapterTest0";
+        case 0x023E77: return "NvramAdapterTest1";
+        case 0x023E78: return "NvramAdapterTest2";
+        case 0x023E79: return "NvramAdapterTest3";
+        case 0x023E7A: return "NvramAdapterTest4";
+        case 0x023E7B: return "NvramAdapterTest5";
+        case 0x023E7C: return "NvramAdapterTest6";
+        case 0x023E7D: return "NvramAdapterTest7";
+
+        // Non-v2 records (tags 0x03/0x04/0x05) — same global name-ID table
+        case 0x030001: return "CfgRuntimeProduct";          // BIOS_SETTINGS
+        case 0x030031: return "CfgDerivative";              // BIOS_SETTINGS
+        case 0x04010D: return "ColdResetMediaSize";         // DEVICE_CONFIG
+        case 0x050032: return "InstallationDate";           // DEVICE_INFO
+        case 0x050A47: return "Dot11LocaleOverride";        // DEVICE_INFO
+
+        default: return "";
+    }
+}
+
+//------------------------------------------------
+// SECTION 7: NVM Object Header
 //
 // Variable-length header (3-5 bytes) encoding from
 // _nvm_build_table and _create_object decompilation:
@@ -422,17 +3332,65 @@ typedef struct {
 //     01: 3-byte header, size = 2
 //     10: 3-byte header, size = 4
 //     11: B3[7]=0 → 4-byte header, size = B3 (1-127)
-//         B3[7]=1 → 5-byte header, size = (B3&0x7F)<<8 | B4
+//         B3[7]=1 → 5-byte header, size = ((B3&0x7F)<<8) | B4
+//
+// -----------------------------------------------------------------
+// COMPATIBILITY NOTE (TLV size-decoding bug seen in auxiliary tools)
+// -----------------------------------------------------------------
+// Auxiliary Python walkers used earlier in this project (the parser
+// that generated tlv_records.txt) had a bug in the B2[7:6]=11 branch
+// which collapsed both sub-cases to `hdr=4, size=B3`. When B3 has the
+// high bit set, that is WRONG — B3 is a size-extension marker, not a
+// literal 1-byte size, and the real size is ((B3&0x7F)<<8)|B4 with a
+// 5-byte header.
+//
+// In firmware 6.28.1.47's eeprom_M24256BW dump the following records
+// hit this bug. The BT template below uses the CORRECT 5-byte-header
+// branch, so parsing here is sound — the entries are listed only so
+// operators cross-checking against tlv_records.txt know what is going
+// on:
+//
+//   offset   name                      true hdr/size   buggy hdr/size  consequence
+//   0x0BC0   eSupplyHistoryEntriesC    hdr=5, 140 B    hdr=4, 128 B    12 tail bytes misparsed as
+//                                                                      phantom TLV "0x19c8" @ 0x0C49
+//   0x0C80   eSupplyHistoryEntriesM    hdr=5, 140 B    hdr=4, 128 B    (no parseable phantom)
+//   0x0D40   eSupplyHistoryEntriesY    hdr=5, 140 B    hdr=4, 128 B    (no parseable phantom)
+//   0x0EC0   eSupplyHistoryEntriesK    hdr=5, 140 B    hdr=4, 128 B    (no parseable phantom)
+//   0x1100   eDCCNVRAMBackupEng        hdr=5, 260 B    hdr=4, 129 B    131 tail bytes misparsed as
+//                                                                      phantom TLV "0x37ba" @ 0x1185
+//
+// The "phantoms" at 0x19c8 (tag 0x04, 4 B) and 0x37ba (tag 0x03,
+// 132 B) are NOT real NVM objects — they are byte patterns inside the
+// eSupplyHistoryEntriesC / eDCCNVRAMBackupEng cipher payloads that
+// coincidentally decode as valid TLV headers. With the correct hdr=5
+// decoding, both phantoms are absorbed into their parent records and
+// the parent records' tails decrypt to the expected zero-padded
+// history/backup-ring format (29/32 or 32/32 trailing zero bytes).
 //------------------------------------------------
 
+// NVM_OBJECT — 3-/4-/5-byte compact TLV header + payload.
+//
+// The top bit of B0 (bit 23 of the 24-bit raw ID word) is the
+// **journal bit**: set by the kernel while a destructive in-place
+// rewrite of a record is in flight, cleared on commit. At boot,
+// `_nvm_build_table` scans for any record whose journal bit is still
+// set and invalidates / rolls back that record (torn write).
+// In a quiescent (cleanly-shut-down) image the bit is always 0.
+// See NVM2_Write_Path.md §7.4 "What Happens When the EEPROM Is
+// Modified" for the full treatment.
 typedef struct {
     local uint64 start_pos = FTell();
     local ubyte B0 = ReadUByte(start_pos);
     local ubyte B1 = ReadUByte(start_pos + 1);
     local ubyte B2 = ReadUByte(start_pos + 2);
 
-    // Compute object ID
-    local uint obj_id = ((uint)B0 << 16) | (((uint)B2 & 0x3F) << 8) | (uint)B1;
+    // Split B0 into the journal bit and the 7-bit vendor_id.
+    local uchar journal_bit = (B0 >> 7) & 1;
+    local uchar vendor_id   = B0 & 0x7F;
+
+    // Compute object ID (journal bit excluded so obj_id is stable
+    // across torn writes; use `journal_bit` to detect in-flight rewrites).
+    local uint obj_id = ((uint)vendor_id << 16) | (((uint)B2 & 0x3F) << 8) | (uint)B1;
 
     // Determine header size and data size
     local int encoding = (B2 >> 6) & 0x3;
@@ -467,9 +3425,53 @@ typedef struct {
 
 } NVM_OBJECT <comment="NVM object", read=ReadNVMObject>;
 
+// Classify storage region from vendor_id.
+//   Region A = flat plaintext            (vendor 1/4/6/10/20)
+//   Region B = Layer-1 XOR only          (vendor 2/3/5)
+//   Region C = Layer-1 + Layer-2 AES-GCM (vendor 2 AND Layer-2 flag)
+// (Can't tell C from B from (vendor, name_id) alone; this only distinguishes
+// A from B/C.)
+string ClassifyNVMRegion(uint vendor) {
+    switch (vendor) {
+        case 0x01: case 0x04: case 0x06: case 0x0a: case 0x14:
+            return "A";      // flat plaintext
+        case 0x02: case 0x03: case 0x05:
+            return "B/C";    // Layer-1 XOR (maybe + Layer-2 AES)
+        default:
+            return "?";
+    }
+}
+
+// Display-name formatter used by ReadNVMObject.
+// Splits the 22-bit obj_id into vendor & name_id, then looks up the
+// human-readable name and (for Region B/C) hints that the payload is
+// Layer-1-XOR-encrypted.
 string ReadNVMObject(NVM_OBJECT &obj) {
     string s;
-    SPrintf(s, "ID=0x%06X size=%d", obj.obj_id, obj.data_size);
+    local uint v   = (obj.obj_id >> 16) & 0xFF;
+    local uint nid = obj.obj_id & 0xFFFF;
+    local string name = LookupNVMName(v, nid);
+    // Every NVM2 record is Region B (Layer-1 XOR) or Region C
+    // (Layer-1 + Layer-2 AES-GCM); Region A (flat plaintext) lives in
+    // NOS Tier-1/2 (0x000-0x1FF), not in NVM2. So we DON'T show the
+    // region on every row — only surface a marker when the vendor_id
+    // is unexpectedly NOT in B/C (that would be a real finding).
+    local string region = ClassifyNVMRegion(v);
+    local string rmark = "";
+    if (region != "B/C") {
+        SPrintf(rmark, " [!region=%s]", region);
+    }
+    // "[J]" marks a record whose journal bit is set — indicates a torn
+    // write that _nvm_build_table would roll back on next boot.
+    local string jmark = obj.journal_bit ? " [J]" : "";
+
+    if (Strlen(name) > 0) {
+        SPrintf(s, "[v=%u nid=0x%04X]%s%s %s  sz=%d",
+                v, nid, rmark, jmark, name, obj.data_size);
+    } else {
+        SPrintf(s, "[v=%u nid=0x%04X]%s%s (unknown)  sz=%d",
+                v, nid, rmark, jmark, obj.data_size);
+    }
     return s;
 }
 
@@ -482,13 +3484,13 @@ FSeek(0);
 // 0x000–0x0FF: NVM partitioned field region (type 0x40 layout)
 NVM_PARTITIONED_FIELDS partitioned_fields <comment="NVM partitioned fields (type 0x40 sub-partition layout)">;
 
-// 0x100–0x131: Flat NVM fields
+// 0x100–0x130: Flat NVM fields
 SetBackColor(cFlatField);
-FLAT_NVM_FIELDS flat_nvm_fields <comment="Flat NVM fields (0x100-0x131)">;
+FLAT_NVM_FIELDS flat_nvm_fields <comment="Flat NVM fields (0x100-0x130, 49 bytes)">;
 
-// 0x131–0x1FD: Gap
-SetBackColor(cPadding);
-FLAT_TO_NVM2_GAP gap_flat_to_nvm2 <comment="Unused gap (0x131-0x1FD)">;
+// 0x131–0x1FD: NOS NVM Extension (backup_device_pin + reserved filler)
+SetBackColor(cNosNvmExt);
+NOS_NVM_EXTENSION nos_nvm_extension <comment="NOS NVM extension (0x131-0x1FD, tier-3)">;
 
 // 0x1FE–0x1FF: Root page pointer (big-endian)
 SetBackColor(cRootPtr);
@@ -888,7 +3890,8 @@ Printf("Span bitmap off:    0x%04X (page %d)\n",
     nvm2_header.span_bitmap_offset,
     nvm2_header.span_bitmap_offset / 64);
 Printf("Debug level:        0x%02X\n", nvm2_header.debug_level);
-Printf("Generation counter: %u\n", nvm2_header.generation_counter);
+Printf("format_count:       %u  (a.k.a. generation_counter / eeprom_recovery_count)\n",
+    nvm2_header.format_count);
 
 // Print bitmap summary
 Printf("\n=== Page Bitmaps ===\n\n");

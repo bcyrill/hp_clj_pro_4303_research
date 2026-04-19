@@ -398,7 +398,7 @@ STMicroelectronics M24256BW 32 KB I2C EEPROM dump handler.
 | Format ID | `hp_clj_pro_4301_eeprom` |
 | Version | 0.1.0 |
 | Chip | M24256BW, 32 KB |
-| KSY files | `hp_tx54_eeprom.ksy` |
+| KSY files | `hp_clj_pro_4301_eeprom.ksy` |
 
 **Zones:**
 
@@ -537,7 +537,7 @@ Format definitions are maintained as `.ksy` files in the `ksy/` directory:
 | `hp_clj_pro_4301_boot.ksy` | Boot partition (A/B) |
 | `hp_clj_pro_4301_lbi.ksy` | Loadable Boot Image |
 | `hp_clj_pro_4301_nand.ksy` | NAND partition layout |
-| `hp_tx54_eeprom.ksy` | EEPROM layout |
+| `hp_clj_pro_4301_eeprom.ksy` | EEPROM layout |
 | `nand_th58bvg2s3hta00_with_oob.ksy` | NAND pages with OOB |
 | `nand_th58bvg2s3hta00_without_oob.ksy` | NAND pages without OOB |
 
